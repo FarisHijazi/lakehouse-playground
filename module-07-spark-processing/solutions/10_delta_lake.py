@@ -1,16 +1,23 @@
 """
-Exercise 12: Delta Lake Operations (MERGE, Time Travel, VACUUM)
+Exercise 10: Delta Lake Operations (MERGE, Time Travel, VACUUM)
 ================================================================
-ACID transactions, upserts, and data versioning with Delta Lake.
+ACID transactions, upserts, and data versioning with Delta Lake on NYC taxi data.
 
 Requires: pip install delta-spark
+
+Databricks equivalent:
+    - Delta is the default format in Databricks -- no extra config needed
+    - MERGE syntax identical in Databricks SQL
+    - Time travel: SELECT * FROM my_table VERSION AS OF 0
+    - VACUUM managed automatically by Databricks with predictive optimization
+    - Unity Catalog tracks all table versions and lineage
 """
 
 from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, lit
-from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
 # Try importing delta -- it is an optional dependency
 try:
@@ -28,7 +35,7 @@ def create_spark_session():
         builder = (
             SparkSession.builder
             .master("local[*]")
-            .appName("DeltaLake-PodcastAnalytics")
+            .appName("DeltaLake-TaxiAnalytics")
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
             .config(
                 "spark.sql.catalog.spark_catalog",
@@ -43,7 +50,7 @@ def create_spark_session():
         spark = (
             SparkSession.builder
             .master("local[*]")
-            .appName("DeltaLake-PodcastAnalytics")
+            .appName("DeltaLake-TaxiAnalytics")
             .config("spark.sql.shuffle.partitions", "8")
             .getOrCreate()
         )
@@ -54,11 +61,12 @@ def main():
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
-    delta_dir = Path(__file__).resolve().parent.parent.parent / "data" / "spark_output" / "delta"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    data_dir = PROJECT_ROOT / "data" / "raw"
+    delta_dir = PROJECT_ROOT / "data" / "spark_output" / "delta"
 
-    users_path = str(delta_dir / "users")
-    events_path = str(delta_dir / "listening_events")
+    zones_path = str(delta_dir / "zones")
+    trips_path = str(delta_dir / "yellow_trips")
 
     if not HAS_DELTA:
         print("Delta Lake is not available. Showing what the code would do.\n")
@@ -66,64 +74,56 @@ def main():
         return
 
     # ----------------------------------------------------------------
-    # 1. Read raw users
+    # 1. Read raw zone lookup
     # ----------------------------------------------------------------
-    users_df = spark.read.csv(str(data_dir / "users.csv"), header=True, inferSchema=True)
-    print(f"Raw users: {users_df.count()} rows")
-    users_df.printSchema()
+    zones_df = spark.read.csv(
+        str(data_dir / "taxi_zone_lookup.csv"), header=True, inferSchema=True
+    )
+    print(f"Raw zones: {zones_df.count()} rows")
+    zones_df.printSchema()
 
     # ----------------------------------------------------------------
     # 2. Write as Delta table
     # ----------------------------------------------------------------
-    print("\n=== Writing Delta Table: Users ===")
+    print("\n=== Writing Delta Table: Zones ===")
     (
-        users_df
+        zones_df
         .write
         .format("delta")
         .mode("overwrite")
-        .save(users_path)
+        .save(zones_path)
     )
-    print(f"Delta table written to: {users_path}")
+    print(f"Delta table written to: {zones_path}")
 
     # ----------------------------------------------------------------
     # 3. Read and verify
     # ----------------------------------------------------------------
-    users_delta = spark.read.format("delta").load(users_path)
-    print(f"\nDelta table row count: {users_delta.count()}")
-    users_delta.show(5, truncate=False)
+    zones_delta = spark.read.format("delta").load(zones_path)
+    print(f"\nDelta table row count: {zones_delta.count()}")
+    zones_delta.show(5, truncate=False)
 
     # ----------------------------------------------------------------
-    # 4. MERGE (upsert): update existing + insert new users
+    # 4. MERGE (upsert): update existing + insert new zones
     # ----------------------------------------------------------------
-    print("\n=== MERGE: Upsert users ===")
+    print("\n=== MERGE: Upsert zones ===")
 
     # Create a small batch of updates:
-    #   - usr_000001: update subscription to "premium"
-    #   - usr_000002: update age to 25
-    #   - usr_999001: brand new user
-    #   - usr_999002: brand new user
+    #   - LocationID 1: update Borough name
+    #   - LocationID 2: update Zone name
+    #   - LocationID 300: brand new zone
+    #   - LocationID 301: brand new zone
     update_schema = StructType([
-        StructField("user_id", StringType(), False),
-        StructField("name", StringType(), True),
-        StructField("email", StringType(), True),
-        StructField("country", StringType(), True),
-        StructField("city", StringType(), True),
-        StructField("platform", StringType(), True),
-        StructField("signup_date", StringType(), True),
-        StructField("subscription_type", StringType(), True),
-        StructField("age", IntegerType(), True),
-        StructField("gender", StringType(), True),
+        StructField("LocationID", IntegerType(), False),
+        StructField("Borough", StringType(), True),
+        StructField("Zone", StringType(), True),
+        StructField("service_zone", StringType(), True),
     ])
 
     update_data = [
-        ("usr_000001", "Zainab", "zainab_3964@hotmail.com", "QA", "Doha", "web",
-         "2019-09-03", "premium", 27, "f"),
-        ("usr_000002", "Yasser", "yasser_7703@gmail.com", "US", "Khobar", "web",
-         "2024-09-10", "free", 25, "male"),
-        ("usr_999001", "NewUser1", "new1@example.com", "SA", "Riyadh", "ios",
-         "2025-01-15", "trial", 30, "M"),
-        ("usr_999002", "NewUser2", "new2@example.com", "AE", "Dubai", "android",
-         "2025-02-20", "free", 22, "F"),
+        (1, "EWR", "Newark Airport - Terminal A", "Airports"),
+        (2, "Queens", "Jamaica Bay West", "Boro Zone"),
+        (300, "Manhattan", "Hudson Yards North", "Yellow Zone"),
+        (301, "Brooklyn", "Gowanus Canal", "Boro Zone"),
     ]
 
     updates_df = spark.createDataFrame(update_data, schema=update_schema)
@@ -131,12 +131,12 @@ def main():
     updates_df.show(truncate=False)
 
     # Perform MERGE
-    delta_table = DeltaTable.forPath(spark, users_path)
+    delta_table = DeltaTable.forPath(spark, zones_path)
     (
         delta_table.alias("target")
         .merge(
             updates_df.alias("source"),
-            "target.user_id = source.user_id",
+            "target.LocationID = source.LocationID",
         )
         .whenMatchedUpdateAll()
         .whenNotMatchedInsertAll()
@@ -144,11 +144,11 @@ def main():
     )
 
     # Verify
-    users_after_merge = spark.read.format("delta").load(users_path)
-    print(f"Users after merge: {users_after_merge.count()} (was {users_df.count()})")
+    zones_after_merge = spark.read.format("delta").load(zones_path)
+    print(f"Zones after merge: {zones_after_merge.count()} (was {zones_df.count()})")
     print("\nUpdated/new records:")
-    users_after_merge.filter(
-        col("user_id").isin("usr_000001", "usr_000002", "usr_999001", "usr_999002")
+    zones_after_merge.filter(
+        col("LocationID").isin(1, 2, 300, 301)
     ).show(truncate=False)
 
     # ----------------------------------------------------------------
@@ -157,22 +157,18 @@ def main():
     print("\n=== Time Travel ===")
 
     # Version 0 = original write
-    users_v0 = spark.read.format("delta").option("versionAsOf", 0).load(users_path)
-    users_current = spark.read.format("delta").load(users_path)
+    zones_v0 = spark.read.format("delta").option("versionAsOf", 0).load(zones_path)
+    zones_current = spark.read.format("delta").load(zones_path)
 
-    print(f"Version 0 row count: {users_v0.count()}")
-    print(f"Current row count  : {users_current.count()}")
-    print(f"Rows added         : {users_current.count() - users_v0.count()}")
+    print(f"Version 0 row count: {zones_v0.count()}")
+    print(f"Current row count  : {zones_current.count()}")
+    print(f"Rows added         : {zones_current.count() - zones_v0.count()}")
 
-    print("\nusr_000001 in version 0:")
-    users_v0.filter(col("user_id") == "usr_000001").select(
-        "user_id", "name", "subscription_type", "city"
-    ).show(truncate=False)
+    print("\nLocationID 1 in version 0:")
+    zones_v0.filter(col("LocationID") == 1).show(truncate=False)
 
-    print("usr_000001 in current version:")
-    users_current.filter(col("user_id") == "usr_000001").select(
-        "user_id", "name", "subscription_type", "city"
-    ).show(truncate=False)
+    print("LocationID 1 in current version:")
+    zones_current.filter(col("LocationID") == 1).show(truncate=False)
 
     # ----------------------------------------------------------------
     # 6. History: view the table changelog
@@ -188,31 +184,30 @@ def main():
     # ----------------------------------------------------------------
     print("\n=== Schema Evolution ===")
 
-    new_user_with_extra_col = spark.createDataFrame(
-        [("usr_999003", "NewUser3", "new3@example.com", "KW", "Kuwait City", "web",
-          "2025-03-01", "premium", 28, "M", "2025-03-01 10:00:00")],
+    new_zone_with_extra_col = spark.createDataFrame(
+        [(302, "Manhattan", "Penn Station South", "Yellow Zone", 40.7484)],
         schema=StructType(
-            update_schema.fields + [StructField("last_login", StringType(), True)]
+            update_schema.fields + [StructField("latitude", DoubleType(), True)]
         ),
     )
 
-    print("New data has an extra column 'last_login':")
-    new_user_with_extra_col.printSchema()
+    print("New data has an extra column 'latitude':")
+    new_zone_with_extra_col.printSchema()
 
     (
-        new_user_with_extra_col
+        new_zone_with_extra_col
         .write
         .format("delta")
         .mode("append")
         .option("mergeSchema", "true")
-        .save(users_path)
+        .save(zones_path)
     )
 
-    evolved = spark.read.format("delta").load(users_path)
+    evolved = spark.read.format("delta").load(zones_path)
     print(f"Schema after evolution:")
     evolved.printSchema()
     print(f"Total rows: {evolved.count()}")
-    evolved.filter(col("user_id") == "usr_999003").show(truncate=False)
+    evolved.filter(col("LocationID") == 302).show(truncate=False)
 
     # ----------------------------------------------------------------
     # 8. VACUUM: clean up old files
@@ -221,7 +216,7 @@ def main():
     print("Disabling retention check for demo (NEVER do this in production)...")
     spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
 
-    delta_table = DeltaTable.forPath(spark, users_path)
+    delta_table = DeltaTable.forPath(spark, zones_path)
     delta_table.vacuum(0)  # 0 hours retention = delete all old versions
 
     print("VACUUM complete. Old file versions removed.")
@@ -229,12 +224,12 @@ def main():
     print("In production, use vacuum(168) to keep 7 days of history.\n")
 
     # Verify current data still works
-    final = spark.read.format("delta").load(users_path)
+    final = spark.read.format("delta").load(zones_path)
     print(f"Final row count after VACUUM: {final.count()}")
 
     # Show final history
     print("\n=== Final History ===")
-    DeltaTable.forPath(spark, users_path).history().select(
+    DeltaTable.forPath(spark, zones_path).history().select(
         "version", "timestamp", "operation"
     ).show(truncate=False)
 
