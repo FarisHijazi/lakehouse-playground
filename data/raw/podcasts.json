@@ -1,0 +1,92 @@
+[
+  {
+    "podcast_id": "pod_001",
+    "name": "سوالف بزنس",
+    "name_en": "Swalif Business",
+    "category": "Business",
+    "language": "ar",
+    "host": "عبدالرحمن أبومالح",
+    "created_at": "2019-03-15"
+  },
+  {
+    "podcast_id": "pod_002",
+    "name": "فنجان",
+    "name_en": "Finjan",
+    "category": "Society & Culture",
+    "language": "ar",
+    "host": "عبدالرحمن أبومالح",
+    "created_at": "2018-01-10"
+  },
+  {
+    "podcast_id": "pod_003",
+    "name": "بودكاست أريكة",
+    "name_en": "Ariika Podcast",
+    "category": "Society & Culture",
+    "language": "ar",
+    "host": "سارة",
+    "created_at": "2020-06-01"
+  },
+  {
+    "podcast_id": "pod_004",
+    "name": "حوارات",
+    "name_en": "Hiwarat",
+    "category": "Education",
+    "language": "ar",
+    "host": "محمد",
+    "created_at": "2019-11-20"
+  },
+  {
+    "podcast_id": "pod_005",
+    "name": "Tech Talks Arabia",
+    "name_en": "Tech Talks Arabia",
+    "category": "Technology",
+    "language": "mixed",
+    "host": "Ahmed Al-Farsi",
+    "created_at": "2020-02-14"
+  },
+  {
+    "podcast_id": "pod_006",
+    "name": "صحتك أولاً",
+    "name_en": "Your Health First",
+    "category": "Health",
+    "language": "ar",
+    "host": "د. نورة",
+    "created_at": "2021-01-05"
+  },
+  {
+    "podcast_id": "pod_007",
+    "name": "كتاب واحد",
+    "name_en": "One Book",
+    "category": "Books",
+    "language": "ar",
+    "host": "خالد",
+    "created_at": "2020-09-10"
+  },
+  {
+    "podcast_id": "pod_008",
+    "name": "The Saudi Startup Show",
+    "name_en": "The Saudi Startup Show",
+    "category": "Business",
+    "language": "en",
+    "host": "Reem Al-Saud",
+    "created_at": "2021-04-01"
+  },
+  {
+    "podcast_id": "pod_009",
+    "name": "رحلة مع القرآن",
+    "name_en": "Journey with Quran",
+    "category": "Religion",
+    "language": "ar",
+    "host": "الشيخ عمر",
+    "created_at": "2019-06-15"
+  },
+  {
+    "podcast_id": "pod_010",
+    "name": "مطبخ البودكاست",
+    "name_en": "Podcast Kitchen",
+    "category": "Food",
+    "language": "ar",
+    "host": "ليلى",
+    "created_at": "2022-01-20"
+  }
+]

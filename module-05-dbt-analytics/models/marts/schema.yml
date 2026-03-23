@@ -1,0 +1,67 @@
+version: 2
+
+models:
+  - name: mart_daily_listens
+    description: >
+      Daily listening activity aggregated by date and podcast.
+      Used for time-series dashboards and trend analysis.
+    columns:
+      - name: event_date
+        description: "Calendar date"
+        tests:
+          - not_null
+      - name: podcast_id
+        description: "Podcast identifier"
+      - name: total_events
+        description: "Total listening events on this date for this podcast"
+      - name: unique_listeners
+        description: "Count of distinct users who listened"
+      - name: avg_listen_pct
+        description: "Average completion percentage"
+
+  - name: mart_podcast_performance
+    description: >
+      Podcast-level performance summary with lifetime and recent metrics.
+      One row per podcast.
+    columns:
+      - name: podcast_id
+        description: "Podcast identifier"
+        tests:
+          - unique
+          - not_null
+      - name: total_listened_hours
+        description: "Total hours listened across all users"
+      - name: completion_rate
+        description: "Percentage of events that were completions"
+      - name: listeners_per_episode
+        description: "Average unique listeners per episode"
+
+  - name: mart_user_cohorts
+    description: >
+      User cohort analysis based on signup month. Tracks retention
+      and engagement metrics by cohort and months since signup.
+    columns:
+      - name: cohort_month
+        description: "Month the user signed up (cohort identifier)"
+        tests:
+          - not_null
+      - name: months_since_signup
+        description: "Number of months between signup and activity"
+      - name: active_users
+        description: "Number of users from this cohort active in this month"
+
+  - name: mart_ad_revenue
+    description: >
+      Ad revenue analysis aggregated by month, advertiser, campaign, and ad type.
+      Includes click-through rates and skip rates.
+    columns:
+      - name: event_month
+        description: "Calendar month of the ad events"
+        tests:
+          - not_null
+      - name: total_revenue_sar
+        description: "Total revenue in Saudi Riyals"
+      - name: click_through_rate
+        description: "Clicks / Impressions as a percentage"
+      - name: skip_rate
+        description: "Skips / Impressions as a percentage"

@@ -1,0 +1,202 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw podcast platform data ingested from files"
+    meta:
+      data_path: "../data/raw"
+    tables:
+      - name: users
+        description: "User profiles from CSV. Contains messy dates and inconsistent gender values."
+        meta:
+          file_path: "../data/raw/users.csv"
+          file_format: csv
+      - name: podcasts
+        description: "Podcast metadata including Arabic and English names."
+        meta:
+          file_path: "../data/raw/podcasts.json"
+          file_format: json
+      - name: episodes
+        description: "Episode details with duration, season, and episode number."
+        meta:
+          file_path: "../data/raw/episodes.json"
+          file_format: json
+      - name: listening_events
+        description: "Daily JSONL files of user listening events. Contains duplicates and outlier durations."
+        meta:
+          file_path: "../data/raw/listening_events/*.jsonl"
+          file_format: jsonl
+      - name: ad_events
+        description: "Ad impression and click events with revenue data."
+        meta:
+          file_path: "../data/raw/ad_events.json"
+          file_format: json
+
+models:
+  - name: stg_users
+    description: >
+      Cleaned user profiles. Standardizes date formats, normalizes gender values,
+      and handles missing cities.
+    columns:
+      - name: user_id
+        description: "Unique user identifier (e.g., usr_000001)"
+        tests:
+          - unique
+          - not_null
+      - name: name
+        description: "User display name"
+      - name: email
+        description: "User email address"
+        tests:
+          - unique
+      - name: country
+        description: "Two-letter country code"
+        tests:
+          - not_null
+      - name: city
+        description: "City name, null if unknown"
+      - name: platform
+        description: "Signup platform"
+        tests:
+          - accepted_values:
+              values: ['ios', 'android', 'web', 'smart_speaker', 'car_play']
+      - name: signup_date
+        description: "Standardized signup date (DATE type)"
+        tests:
+          - not_null
+      - name: subscription_type
+        description: "Subscription tier"
+        tests:
+          - accepted_values:
+              values: ['free', 'premium', 'trial']
+      - name: age
+        description: "User age at signup"
+      - name: gender
+        description: "Standardized gender (male, female, other, unknown)"
+        tests:
+          - accepted_values:
+              values: ['male', 'female', 'other', 'unknown']
+
+  - name: stg_podcasts
+    description: "Cleaned podcast metadata with both Arabic and English names."
+    columns:
+      - name: podcast_id
+        description: "Unique podcast identifier (e.g., pod_001)"
+        tests:
+          - unique
+          - not_null
+      - name: name
+        description: "Podcast name (Arabic)"
+      - name: name_en
+        description: "Podcast name (English)"
+      - name: category
+        description: "Podcast category"
+        tests:
+          - not_null
+      - name: language
+        description: "Primary language code"
+      - name: host
+        description: "Host name"
+      - name: created_at
+        description: "Date the podcast was created"
+
+  - name: stg_episodes
+    description: "Cleaned episode metadata with duration and ordering information."
+    columns:
+      - name: episode_id
+        description: "Unique episode identifier (e.g., ep_0001)"
+        tests:
+          - unique
+          - not_null
+      - name: podcast_id
+        description: "Parent podcast identifier"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_podcasts')
+              field: podcast_id
+      - name: title
+        description: "Episode title"
+      - name: published_at
+        description: "Publication timestamp"
+      - name: duration_seconds
+        description: "Episode duration in seconds"
+      - name: season
+        description: "Season number"
+      - name: episode_number
+        description: "Episode number within the season"
+
+  - name: stg_listening_events
+    description: >
+      Deduplicated listening events with outlier durations capped.
+      Reads from all daily JSONL files under listening_events/.
+    columns:
+      - name: event_id
+        description: "Unique event identifier (UUID)"
+        tests:
+          - unique
+          - not_null
+      - name: user_id
+        description: "User who generated the event"
+        tests:
+          - not_null
+      - name: episode_id
+        description: "Episode being listened to"
+        tests:
+          - not_null
+      - name: event_type
+        description: "Type of listening event"
+        tests:
+          - accepted_values:
+              values: ['play', 'pause', 'resume', 'complete', 'skip', 'seek']
+      - name: event_timestamp
+        description: "When the event occurred"
+        tests:
+          - not_null
+      - name: listened_seconds
+        description: "Seconds listened (capped at episode duration, floor at 0)"
+      - name: platform
+        description: "Platform used for listening"
+      - name: country
+        description: "Country where the event occurred"
+      - name: app_version
+        description: "Application version string"
+
+  - name: stg_ad_events
+    description: "Cleaned ad events with revenue and campaign information."
+    columns:
+      - name: ad_event_id
+        description: "Unique ad event identifier (UUID)"
+        tests:
+          - unique
+          - not_null
+      - name: event_id
+        description: "Related listening event identifier"
+        tests:
+          - not_null
+      - name: user_id
+        description: "User who saw/clicked the ad"
+        tests:
+          - not_null
+      - name: event_timestamp
+        description: "When the ad event occurred"
+        tests:
+          - not_null
+      - name: ad_type
+        description: "Ad placement type"
+        tests:
+          - accepted_values:
+              values: ['pre_roll', 'mid_roll', 'post_roll']
+      - name: action
+        description: "User action on the ad"
+        tests:
+          - accepted_values:
+              values: ['impression', 'click', 'skip']
+      - name: advertiser
+        description: "Advertiser name"
+      - name: campaign_id
+        description: "Campaign identifier"
+      - name: revenue_sar
+        description: "Revenue in Saudi Riyals"
+      - name: duration_seconds
+        description: "Ad duration in seconds"

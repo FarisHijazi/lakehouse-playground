@@ -1,0 +1,164 @@
+# =============================================================================
+# Airflow Docker Compose - Module 03
+# =============================================================================
+# This sets up Apache Airflow with the LocalExecutor for simplicity.
+# Components:
+#   - Postgres:   Airflow metadata database
+#   - Webserver:  The Airflow UI (port 8080)
+#   - Scheduler:  Parses DAGs and triggers task execution
+#   - Init:       One-time setup (create admin user, initialize DB)
+#
+# Usage:
+#   docker compose up -d          # Start everything
+#   docker compose down           # Stop everything
+#   docker compose down -v        # Stop and remove volumes (full reset)
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment: &airflow-common-env
+    # ---- Core settings ----
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+
+    # ---- Database ----
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+
+    # ---- Webserver ----
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+
+    # ---- Scheduler ----
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 30
+
+    # ---- Logging ----
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+
+    # ---- Install extra Python packages at startup ----
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      pandas>=2.0.0
+      pyarrow>=14.0.0
+
+  volumes:
+    # Mount DAGs from this module
+    - ./dags:/opt/airflow/dags
+
+    # Mount the project data directory so DAGs can read/write data
+    - ../data:/opt/airflow/data
+
+    # Persist logs across restarts
+    - airflow-logs:/opt/airflow/logs
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+  networks:
+    - airflow-net
+
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres - Airflow metadata database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"        # Exposed on 5433 to avoid conflicts with host Postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-net
+
+  # ---------------------------------------------------------------------------
+  # Airflow Init - Database migration and admin user creation
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Initialize the database
+        airflow db migrate
+
+        # Create admin user (ignore error if user already exists)
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+
+        echo "Airflow initialization complete."
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Airflow Webserver - The UI on port 8080
+  # ---------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Airflow Scheduler - Parses DAGs and triggers tasks
+  # ---------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  airflow-logs:
+    driver: local
+
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  airflow-net:
+    driver: bridge
