@@ -6,14 +6,15 @@ Work through these exercises in order. Each builds on the previous one. Use Duck
 
 ## Exercise 1: Design a Star Schema
 
-**Goal:** Draw (on paper or in a diagram tool) the star schema for the podcast analytics warehouse.
+**Goal:** Draw (on paper or in a diagram tool) the star schema for the NYC taxi trip analytics warehouse.
 
 **Tasks:**
 
 1. Identify the **business processes** we want to analyse:
-   - Listening behaviour (who listened to what, when, for how long)
-   - Ad revenue (which ads were shown, clicks, revenue)
-   - CDN quality (streaming quality, buffer events, errors)
+   - Yellow taxi trips (fare revenue, distances, tip behaviour)
+   - Green taxi trips (outer-borough service patterns)
+   - For-hire vehicle trips (Uber, Lyft, livery car usage)
+   - Weather impact on transportation
 
 2. For each business process, identify:
    - The **grain** (one row = one ___?)
@@ -23,30 +24,33 @@ Work through these exercises in order. Each builds on the previous one. Use Duck
 3. Design these tables:
 
    **Dimension Tables:**
-   - `dim_users` -- user attributes
-   - `dim_podcasts` -- podcast attributes
-   - `dim_episodes` -- episode attributes
-   - `dim_dates` -- calendar dimension (a row per day)
+   - `dim_zones` -- taxi zone attributes (borough, zone name, service zone)
+   - `dim_vendors` -- yellow/green taxi vendor companies
+   - `dim_rate_codes` -- rate code descriptions (standard, JFK, Newark, etc.)
+   - `dim_payment_types` -- payment method descriptions
+   - `dim_fhv_bases` -- for-hire vehicle base companies (Uber, Lyft, etc.)
+   - `dim_date` -- calendar dimension (one row per day)
+   - `dim_weather` -- daily weather conditions
 
    **Fact Tables:**
-   - `fact_listens` -- one row per listening event
-   - `fact_ad_events` -- one row per ad impression or click
-   - `fact_cdn_quality` -- one row per CDN log entry
+   - `fact_yellow_trips` -- one row per yellow taxi trip
+   - `fact_green_trips` -- one row per green taxi trip
+   - `fact_fhv_trips` -- one row per for-hire vehicle trip
 
 4. For each table, list the columns, data types, and key relationships.
 
 **Hints:**
-- Look at the raw data files to understand available columns.
-- Fact tables should contain only foreign keys (to dimensions) and numeric measures.
+- Look at the raw Parquet and CSV files to understand available columns.
+- Fact tables should contain foreign keys (to dimensions) and numeric measures.
 - Push descriptive attributes into dimension tables.
 
 ---
 
 ## Exercise 2: Create Dimension Tables
 
-**Goal:** Write SQL (using DuckDB) to create the four dimension tables from raw data.
+**Goal:** Write SQL (using DuckDB) to create the dimension tables from raw data.
 
-### 2a: dim_dates
+### 2a: dim_date
 
 Create a date dimension covering 2018-01-01 to 2025-12-31. Include:
 
@@ -70,74 +74,88 @@ Create a date dimension covering 2018-01-01 to 2025-12-31. Include:
 SELECT UNNEST(generate_series(DATE '2018-01-01', DATE '2025-12-31', INTERVAL 1 DAY)) AS full_date
 ```
 
-### 2b: dim_users
+### 2b: dim_zones
 
-Load from `users.csv`. Handle:
-- Generate a surrogate `user_key` (integer)
-- Standardise `gender` values (the raw data has 'f', 'F', 'female', 'male', 'm', 'M')
-- Parse the messy `signup_date` (multiple formats: `YYYY-MM-DD`, `DD/MM/YYYY`, `YYYY-MM-DDT00:00:00`, `DD-MM-YYYY`)
-- Handle NULL cities
+Load from `taxi_zones.csv`. Include:
+- `location_id` (the TLC zone ID, used as the key)
+- `borough`, `zone`, `service_zone`
 
-### 2c: dim_podcasts
+### 2c: dim_vendors
 
-Load from `podcasts.json`. Include:
-- Surrogate `podcast_key`
-- All attributes: `podcast_id`, `name`, `name_en`, `category`, `language`, `host`, `created_at`
+Load from `vendors.csv`. Include:
+- `vendor_id`, `vendor_name`
 
-### 2d: dim_episodes
+### 2d: dim_rate_codes
 
-Load from `episodes.json`. Include:
-- Surrogate `episode_key`
-- All attributes plus a derived `duration_minutes` column
-- Join-ready `podcast_id` for linking to `dim_podcasts`
+Load from `rate_codes.csv`. Include:
+- `rate_code_id`, `rate_code_name`
+
+### 2e: dim_payment_types
+
+Load from `payment_types.csv`. Include:
+- `payment_type_id`, `payment_type_name`
+
+### 2f: dim_fhv_bases
+
+Load from `fhv_bases.csv`. Include:
+- `base_number`, `base_name`, `dba` (doing business as), `base_type`
+
+### 2g: dim_weather
+
+Load from `daily_weather.csv`. Include:
+- `date` as the key
+- Temperature, precipitation, snow, wind speed columns
+- Derive a `weather_category` column: 'Snow', 'Rain', 'Clear'
 
 ---
 
 ## Exercise 3: Create Fact Tables
 
-**Goal:** Create the three fact tables, joining to dimension keys.
+**Goal:** Create the three fact tables from raw Parquet files, joining to dimension keys.
 
-### 3a: fact_listens
+### 3a: fact_yellow_trips
 
-Load from `listening_events/*.jsonl`. For each listening event:
-- Look up `user_key` from `dim_users`
-- Look up `episode_key` from `dim_episodes`
-- Look up `date_key` from `dim_dates`
-- Calculate `completion_pct` = `listened_seconds / episode_duration_seconds`
-- Keep: `event_id`, `user_key`, `episode_key`, `date_key`, `event_type`, `listened_seconds`, `completion_pct`, `platform`, `country`
+Load from `yellow_taxi_trips.parquet`. For each trip:
+- Map pickup/dropoff location IDs to `dim_zones`
+- Map `VendorID` to `dim_vendors`
+- Map `RatecodeID` to `dim_rate_codes`
+- Map `payment_type` to `dim_payment_types`
+- Look up `date_key` from `dim_date`
+- Calculate `trip_duration_minutes` from pickup/dropoff timestamps
+- Keep all fare-related measures: `fare_amount`, `tip_amount`, `tolls_amount`, `total_amount`, `trip_distance`, `passenger_count`
 
-**Hint:** DuckDB can read all JSONL files at once:
+**Hint:** DuckDB reads Parquet natively and efficiently:
 ```sql
-SELECT * FROM read_json_auto('data/raw/listening_events/*.jsonl')
+SELECT * FROM read_parquet('data/raw/yellow_taxi_trips.parquet')
 ```
 
-### 3b: fact_ad_events
+### 3b: fact_green_trips
 
-Load from `ad_events.json`. For each ad event:
-- Look up `user_key`, `date_key`
-- Keep: `ad_event_id`, `user_key`, `date_key`, `event_id`, `ad_type`, `action`, `advertiser`, `campaign_id`, `revenue_sar`, `duration_seconds`
+Load from `green_taxi_trips.parquet`. Similar structure to yellow trips.
 
-### 3c: fact_cdn_quality
+### 3c: fact_fhv_trips
 
-Load from `cdn_logs.csv`. For each CDN log entry:
-- Look up `user_key`, `date_key`
-- Keep: `log_id`, `user_key`, `date_key`, `event_id`, `isp`, `bitrate`, `buffer_events`, `rebuffer_ratio`, `startup_time_ms`, `error_type`, `cdn_node`, `bytes_transferred`
+Load from `fhv_trips.parquet`. For each for-hire vehicle trip:
+- Map pickup/dropoff location IDs to `dim_zones`
+- Map `dispatching_base_num` to `dim_fhv_bases`
+- Calculate `trip_duration_minutes` from pickup/dropoff timestamps
+- Note: FHV trips have no fare data (Uber/Lyft do not report fares to TLC)
 
 ---
 
-## Exercise 4: Implement SCD Type 2 for Podcasts Dimension
+## Exercise 4: Implement SCD Type 2 for Taxi Zones
 
-**Goal:** Implement Slowly Changing Dimension Type 2 to track podcast attribute changes over time.
+**Goal:** Implement Slowly Changing Dimension Type 2 to track taxi zone boundary changes.
 
-**Scenario:** The following changes happened to our podcasts:
+**Scenario:** The following changes happened to taxi zones over time:
 
-1. **2023-07-01**: "سوالف بزنس" (pod_001) rebrands to "سوالف بزنس وتقنية" (Swalif Business & Tech)
-2. **2024-01-15**: pod_001 changes category from "Business" to "Business & Technology"
-3. **2024-03-01**: "بودكاست أريكة" (pod_003) changes host from "سارة" to "سارة ونورة" (Sara & Noura)
+1. **2023-07-01**: Zone 261 renames from "World Trade Center" to "World Trade Center / Battery Park"
+2. **2024-01-15**: Zone 132 (JFK Airport) changes service_zone from "Airports" to "Major Airports"
+3. **2024-06-01**: Zone 138 (LaGuardia Airport) changes borough classification from "Queens" to "Airport Authority"
 
 **Tasks:**
 
-1. Add SCD Type 2 columns to `dim_podcasts`:
+1. Add SCD Type 2 columns to `dim_zones`:
    - `valid_from` (DATE)
    - `valid_to` (DATE, use '9999-12-31' for current records)
    - `is_current` (BOOLEAN)
@@ -147,10 +165,7 @@ Load from `cdn_logs.csv`. For each CDN log entry:
    - Inserts a new record with the updated values
    - Assigns a new surrogate key
 
-3. After processing all three changes, verify that:
-   - `dim_podcasts` has 13 rows (10 original + 3 new versions)
-   - Querying with `is_current = true` returns 10 rows
-   - Querying pod_001 returns 3 rows (original + 2 changes)
+3. After processing all three changes, verify that the history is preserved correctly.
 
 ---
 
@@ -158,42 +173,44 @@ Load from `cdn_logs.csv`. For each CDN log entry:
 
 Write SQL queries to answer these business questions. Use the warehouse tables you built.
 
-### 5a: Top 10 Podcasts by Total Listening Hours (Per Month)
+### 5a: Revenue by Borough and Zone
 
-For each month, rank podcasts by total listening hours. Show:
-- Month, podcast name, total hours, rank within month
+For each borough, find the top 10 pickup zones by total fare revenue from yellow taxi trips. Show:
+- Borough, zone name, total revenue, trip count, average fare
 
-### 5b: User Cohort Retention
+### 5b: Trip Patterns by Hour and Day
 
-Group users by their signup month (cohort). For each cohort, calculate:
-- How many users were active (had at least one listen) in each subsequent month
-- Retention rate = active users / cohort size
+Create a heatmap-ready dataset showing trip volume by hour of day and day of week:
+- `day_of_week`, `day_name`, `hour_of_day`, `total_trips`, `avg_fare`
 
-**Output columns:** `cohort_month`, `months_since_signup`, `cohort_size`, `active_users`, `retention_rate`
+### 5c: Weather Impact on Trip Volume
 
-### 5c: Ad Revenue by Show
+Join trips to weather data and analyse:
+- How do rainy/snowy days affect trip counts vs clear days?
+- What is the average fare on bad-weather days vs good-weather days?
+- Does tipping behaviour change with weather?
 
-For each podcast, calculate:
-- Total ad revenue (SAR)
-- Number of impressions
-- Number of clicks
-- Click-through rate (CTR)
-- Revenue per 1000 impressions (RPM)
+### 5d: Uber vs Lyft vs Taxi Comparison
 
-Join through: `fact_ad_events` -> `fact_listens` (via `event_id`) -> `dim_episodes` -> `dim_podcasts`
+Compare for-hire vehicles (grouped by base company) with yellow/green taxis:
+- Total trips by service type
+- Average trip duration
+- Most popular pickup zones by service type
 
-### 5d: Peak Listening Hours
+### 5e: Tip Analysis by Payment Type
 
-Find the hour of day and day of week when listening is most popular. Show a heatmap-ready result:
-- `day_of_week`, `hour_of_day`, `total_listens`, `avg_listened_seconds`
+Analyse tipping behaviour:
+- Average tip percentage by payment type
+- Tip percentage distribution (what fraction of fare goes to tips?)
+- Does trip distance affect tip percentage?
 
-### 5e: Streaming Quality by ISP
+### 5f: Airport Trip Analysis
 
-For each ISP, calculate:
-- Average startup time
-- Average rebuffer ratio
-- Error rate (percentage of requests with a non-null error)
-- Average bytes transferred
+Analyse trips to/from the three major airports (JFK zone 132, LaGuardia zone 138, Newark zone 1):
+- Trip volume by airport and direction (to/from)
+- Average fare by airport
+- Peak hours for airport trips
+- Most common origin/destination zones for each airport
 
 ---
 
@@ -203,23 +220,23 @@ For each ISP, calculate:
 
 **Tasks:**
 
-1. Export `fact_listens` to Hive-partitioned Parquet files:
+1. Export `fact_yellow_trips` to Hive-partitioned Parquet files:
 ```sql
 COPY (
-    SELECT *, year(event_date) AS year, month(event_date) AS month
-    FROM fact_listens
+    SELECT *, year(pickup_datetime) AS year, month(pickup_datetime) AS month
+    FROM fact_yellow_trips
 )
-TO 'output/fact_listens_partitioned'
+TO 'output/yellow_trips_partitioned'
 (FORMAT PARQUET, PARTITION_BY (year, month));
 ```
 
 2. Query the partitioned data and observe that DuckDB only reads relevant partitions:
 ```sql
-SELECT count(*) FROM parquet_scan('output/fact_listens_partitioned/**/*.parquet', hive_partitioning=true)
+SELECT count(*) FROM parquet_scan('output/yellow_trips_partitioned/**/*.parquet', hive_partitioning=true)
 WHERE year = 2023 AND month = 6;
 ```
 
-3. Compare query performance (timing) between the partitioned Parquet and the DuckDB table.
+3. Compare query performance between the partitioned Parquet and the DuckDB table.
 
 ---
 
@@ -227,70 +244,57 @@ WHERE year = 2023 AND month = 6;
 
 Write queries using window functions. Each query should be a single SQL statement.
 
-### 7a: Running Total of Listens Per Podcast
+### 7a: Running Total of Daily Revenue
 
-For each podcast, calculate the cumulative number of listens per day:
-- `event_date`, `podcast_name`, `daily_listens`, `running_total_listens`
+For each borough, calculate the cumulative daily revenue from yellow taxi trips:
+- `pickup_date`, `borough`, `daily_revenue`, `running_total_revenue`
 
-### 7b: Rank Users by Listening Time
+### 7b: Rank Zones by Trip Volume
 
-Rank users by their total listening time. Use:
+Rank pickup zones by total trip count. Use:
 - `RANK()` -- allows gaps (1, 2, 2, 4)
 - `DENSE_RANK()` -- no gaps (1, 2, 2, 3)
 - `ROW_NUMBER()` -- unique (1, 2, 3, 4)
 
-Show all three rankings side by side.
+Show all three rankings side by side, partitioned by borough.
 
-### 7c: 7-Day Moving Average of Daily Listens
+### 7c: Moving Average of Trip Distances
 
-Calculate a 7-day rolling average of total listens per day across the platform.
+Calculate a 7-day rolling average of trip distance per day for yellow taxis.
 
 ### 7d: Month-over-Month Growth Rate
 
-For each podcast, calculate the month-over-month growth rate in listening hours.
+For each borough, calculate month-over-month growth in trip count.
 Use `LAG()` to reference the previous month.
 
-### 7e: Percentile Distribution of Listen Duration
+### 7e: Percent of Total Calculations
 
-For each podcast category, calculate the 25th, 50th (median), 75th, and 95th percentiles of listen duration.
+For each zone, calculate:
+- What percentage of the borough's total trips does this zone represent?
+- What percentage of the city's total trips does this zone represent?
+
+Use `SUM() OVER (PARTITION BY ...)` for the denominator.
 
 ---
 
-## Exercise 8: CTEs and Complex Analytics
+## Exercise 8: Advanced Analytics with CTEs
 
 Write each query using Common Table Expressions (CTEs) for readability.
 
-### 8a: Power Listeners Analysis
+### 8a: Peak Hour Analysis by Borough
 
-Find "power listeners" (users in the top 5% by total listening time) and compare their behaviour:
-- Average session length
-- Number of unique podcasts
-- Most common platform
-- Subscription type distribution
+Find the busiest hour of day for each borough, comparing weekdays vs weekends.
 
-### 8b: Podcast Similarity (Content-Based)
+### 8b: Cross-Borough Trip Analysis
 
-Find pairs of podcasts that share the most listeners. For each pair:
-- Number of shared listeners
-- Jaccard similarity (shared / union)
+Analyse trips where pickup and dropoff are in different boroughs:
+- Most common borough-to-borough routes
+- Average fare for cross-borough trips
+- How do cross-borough trips compare in distance and duration?
 
-### 8c: Funnel Analysis
+### 8c: Weather-Revenue Correlation
 
-Build a listening funnel:
-1. Users who started an episode (event_type = 'start' or 'play')
-2. Users who listened past 50% (completion_pct > 0.5)
-3. Users who completed an episode (event_type = 'complete')
-
-Show conversion rates between each stage, broken down by podcast category.
-
-### 8d: Revenue Attribution
-
-Attribute ad revenue to podcasts by tracing:
-`ad_event` -> `listening_event` (via event_id) -> `episode` -> `podcast`
-
-Calculate:
-- Revenue per podcast
-- Revenue per listen
-- Revenue per listening hour
-
-Use CTEs to build the attribution chain step by step.
+Build a daily summary combining trip revenue and weather, then:
+- Calculate correlation between temperature and daily revenue
+- Find the revenue impact of each additional inch of precipitation
+- Identify the worst-weather days and their revenue impact

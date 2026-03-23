@@ -4,20 +4,109 @@
 
 The **Medallion Architecture** (also called multi-hop architecture) is a data design
 pattern that organizes data in a lakehouse into three progressive layers of quality
-and refinement: **Bronze**, **Silver**, and **Gold**. Each layer serves a distinct
-purpose and builds upon the previous one, creating a clear data quality pipeline
-from raw ingestion to business-ready analytics.
+and refinement: **Bronze**, **Silver**, and **Gold**. Databricks popularized this
+pattern as THE standard approach for building production data pipelines on Delta Lake.
+
+This module implements the medallion architecture locally with PySpark, using real
+NYC Taxi & Limousine Commission (TLC) trip data. Every script includes comments
+showing the equivalent Databricks notebook code, Delta Live Tables (DLT) syntax,
+and Unity Catalog patterns you would use in a production Databricks environment.
 
 ```
-  Raw Sources          Bronze             Silver              Gold
- +-----------+     +------------+     +-------------+    +--------------+
- | JSON      |---->| Raw as-is  |---->| Cleaned     |--->| Aggregated   |
- | CSV       |     | Append-only|     | Deduplicated|    | Business KPIs|
- | JSONL     |     | Schema-on- |     | Typed &     |    | Dashboard-   |
- | Logs      |     | read       |     | Validated   |    | ready tables |
- +-----------+     +------------+     +-------------+    +--------------+
-                     "Land it"         "Refine it"         "Serve it"
+  Raw Sources            Bronze               Silver                Gold
+ +---------------+   +--------------+    +----------------+   +-----------------+
+ | yellow_trip   |-->| Raw as-is    |--->| Cleaned trips  |-->| Daily metrics   |
+ | green_trip    |   | + metadata   |    | Deduped        |   | Zone analytics  |
+ | fhvhv_trip    |   | + _ingested  |    | Typed/validated|   | Hourly patterns |
+ | taxi_zones    |   | + _source    |    | + derived cols |   | Weather impact  |
+ | weather       |   | Append-only  |    | Quarantined    |   | Dashboard-ready |
+ +---------------+   +--------------+    +----------------+   +-----------------+
+                        "Land it"           "Refine it"          "Serve it"
 ```
+
+---
+
+## Databricks Context: Why This Pattern Matters
+
+### The Databricks Lakehouse
+
+Databricks built its entire platform around the lakehouse concept. The medallion
+architecture is not just a suggestion -- it is the recommended and documented way
+to organize data in Databricks. When you create a new Databricks workspace, the
+default catalog structure assumes Bronze/Silver/Gold layers.
+
+### Delta Live Tables (DLT)
+
+In Databricks, you would implement this pipeline using **Delta Live Tables**, which
+provides:
+
+- **Declarative pipeline definitions**: You declare what each table should contain,
+  and DLT handles orchestration, dependency management, and incremental processing.
+- **Built-in data quality**: `@dlt.expect` decorators enforce data quality rules
+  at each layer.
+- **Automatic lineage tracking**: DLT tracks data flow across layers automatically.
+
+```python
+# Databricks DLT equivalent of what we build locally:
+import dlt
+from pyspark.sql.functions import *
+
+@dlt.table(comment="Raw yellow taxi trips, ingested as-is")
+def bronze_yellow_trips():
+    return (
+        spark.readStream
+        .format("cloudFiles")          # Auto Loader
+        .option("cloudFiles.format", "parquet")
+        .load("/mnt/raw/yellow_tripdata_*.parquet")
+        .select("*", "_metadata.file_path", "_metadata.file_modification_time")
+    )
+
+@dlt.table(comment="Cleaned yellow taxi trips")
+@dlt.expect_or_drop("valid_fare", "fare_amount >= 0")
+@dlt.expect_or_drop("valid_pickup", "tpep_pickup_datetime IS NOT NULL")
+def silver_yellow_trips():
+    return (
+        dlt.read("bronze_yellow_trips")
+        .filter(col("tpep_pickup_datetime").isNotNull())
+        .withColumn("trip_duration_minutes", ...)
+    )
+
+@dlt.table(comment="Daily trip metrics by taxi type")
+def gold_daily_metrics():
+    return (
+        dlt.read("silver_yellow_trips")
+        .groupBy("pickup_date")
+        .agg(count("*").alias("total_trips"), ...)
+    )
+```
+
+### Unity Catalog
+
+In production Databricks, tables are organized in a three-level namespace:
+
+```
+catalog.schema.table
+  |       |      |
+  |       |      +-- e.g., gold_daily_metrics
+  |       +--------- e.g., gold, silver, bronze
+  +----------------- e.g., nyc_taxi
+```
+
+Example fully qualified names:
+- `nyc_taxi.bronze.raw_yellow_trips`
+- `nyc_taxi.silver.clean_yellow_trips`
+- `nyc_taxi.gold.daily_trip_metrics`
+- `nyc_taxi.gold.zone_analytics`
+
+### Governance Features
+
+- **Access Control:** Data engineers get write access to bronze/silver; analysts
+  get read-only access to silver/gold.
+- **Data Lineage:** Unity Catalog automatically tracks which tables produced which
+  other tables. You can visualize the full flow from Bronze to Gold.
+- **Audit Logging:** Every query and table access is logged for compliance.
+- **Data Discovery:** Searchable catalog of all tables with descriptions, tags, and
+  ownership information.
 
 ---
 
@@ -32,246 +121,165 @@ without re-ingesting everything.
 
 ### Data Quality Progression
 
-Raw data is messy: mixed date formats, duplicate records, null values, late-arriving
-events. Rather than trying to fix everything in a single monolithic ETL job, the
-medallion pattern applies transformations incrementally. Each layer adds a specific
-set of guarantees.
+Raw taxi data is messy: negative fares, null pickup/dropoff times, impossible speeds,
+zero-distance trips. Rather than trying to fix everything in a single monolithic ETL
+job, the medallion pattern applies transformations incrementally.
 
 ### Reprocessing and Recovery
 
 Because Bronze retains the raw data, you can always reprocess Silver and Gold layers
 when you discover bugs in your transformation logic or when business definitions
-change. This is not possible with traditional ETL that transforms data in-place.
+change. This is essential for taxi data, where TLC periodically revises data quality
+standards.
 
 ### Team Autonomy
 
 Data engineers own Bronze and Silver. Analytics engineers and data scientists work
-with Silver and Gold. Each team operates on the layer appropriate to their skill set
-and responsibilities.
+with Silver and Gold. Each team operates on the layer appropriate to their skill set.
 
 ---
 
 ## Delta Lake: Why It Matters
 
 Delta Lake is an open-source storage layer that brings reliability to data lakes.
-While this module uses Parquet files for compatibility (PySpark and Delta Lake proper
-are covered in Module 07), it is important to understand why Delta Lake improves on
-raw Parquet.
+This module uses Parquet files with PySpark for local compatibility, but in a
+Databricks environment you would use Delta format for all tables.
 
 ### What Delta Lake Adds Over Raw Parquet
 
 | Capability | Raw Parquet | Delta Lake |
 |---|---|---|
-| **ACID Transactions** | No. A failed write can leave partial/corrupt files. | Yes. Writes are atomic -- they either fully succeed or fully roll back. |
-| **Time Travel** | No. Once overwritten, previous data is gone. | Yes. Every version is retained. You can query data as of any past version or timestamp. |
-| **MERGE (Upsert)** | Not supported. You must read-modify-write manually. | Native MERGE command: `MERGE INTO target USING source ON condition WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`. |
-| **Schema Evolution** | Manual. Adding columns requires rewriting all files or careful union logic. | Built-in. `mergeSchema` option automatically reconciles new columns. |
+| **ACID Transactions** | No. A failed write can leave partial/corrupt files. | Yes. Writes are atomic. |
+| **Time Travel** | No. Once overwritten, previous data is gone. | Yes. Query data as of any past version or timestamp. |
+| **MERGE (Upsert)** | Not supported. Read-modify-write manually. | Native `MERGE INTO` command for handling late-arriving taxi records. |
+| **Schema Evolution** | Manual. Adding columns requires rewriting all files. | Built-in. `mergeSchema` option reconciles new columns (e.g., when `airport_fee` was added in 2019). |
 | **Schema Enforcement** | None. Any file can be dumped into a directory. | Rejects writes that do not match the table schema unless evolution is enabled. |
-| **Audit History** | None. | Full transaction log showing who changed what and when. |
+| **Z-Ordering** | Not available. | `OPTIMIZE ... ZORDER BY (pickup_datetime)` for fast time-range queries. |
 | **Concurrent Writes** | Unsafe. Two writers can corrupt data. | Optimistic concurrency control handles multiple writers safely. |
 
 ### The Delta Transaction Log
 
 Delta Lake stores a `_delta_log/` directory alongside the Parquet data files. This
-log contains JSON entries for every transaction (add file, remove file, metadata
-change). The log is the source of truth -- it defines which Parquet files are
-"current" and enables time travel, rollback, and ACID guarantees.
+log contains JSON entries for every transaction. The log is the source of truth --
+it defines which Parquet files are "current" and enables time travel, rollback, and
+ACID guarantees.
+
+```sql
+-- In Databricks, you can time-travel to see yesterday's data:
+SELECT * FROM nyc_taxi.silver.yellow_trips VERSION AS OF 42;
+SELECT * FROM nyc_taxi.silver.yellow_trips TIMESTAMP AS OF '2024-01-15';
+```
 
 ---
 
-## The Three Layers in Detail
+## The Three Layers in Detail (NYC Taxi Context)
 
 ### Bronze Layer (Raw / Landing)
 
-**Purpose:** Faithful copy of source data. No transformations, no filtering, no
-deduplication.
-
-**Principles:**
-- **Append-only.** Never update or delete records in Bronze. If a source sends
-  corrected data, append it -- deduplication happens in Silver.
-- **Schema-on-read.** Store data in its original schema. If the source adds a new
-  column tomorrow, Bronze should not break.
-- **Metadata enrichment.** Add ingestion metadata: `_ingested_at` timestamp,
-  `_source_file` name, `_batch_id`. This enables lineage and debugging.
-- **Partitioning.** Partition by ingestion date (`_ingested_date`) to enable
-  efficient incremental processing.
+**Purpose:** Faithful copy of TLC source data. No transformations, no filtering.
 
 **What gets stored:**
-- Raw JSON parsed into columnar format (Parquet) but with original field names and
-  values
-- CSV files read with minimal type inference
-- JSONL files preserved record-by-record
+- Raw parquet files from TLC with original column names and values
+- CSV reference data (taxi zones, vendors, rate codes) read with minimal type inference
+- Weather data preserved as-is
 
-**Example quality issues that Bronze retains:**
-- Mixed date formats (`2024-01-15`, `15/01/2024`, `01-15-2024`)
-- Null/missing values
-- Duplicate records
-- Inconsistent categorical values (`male`, `Male`, `m`, `M`)
-- Negative values where only positive make sense
-- Late-arriving events (events timestamped days before the file date)
+**Metadata added:**
+- `_ingested_at`: When the pipeline ran
+- `_source_file`: Original filename (e.g., `yellow_tripdata_2023-01.parquet`)
+- `_batch_id`: UUID identifying this ingestion batch
+
+**Quality issues Bronze retains:**
+- Negative fares and tip amounts
+- Null pickup/dropoff datetimes
+- Trips with zero distance but non-zero fare
+- Trips with impossibly high speeds (data entry errors)
+- Future-dated trips (timestamp errors)
 
 ```python
-# Bronze philosophy: land it as-is, add metadata
-df["_ingested_at"] = datetime.now().isoformat()
-df["_source_file"] = source_filename
-df.to_parquet(bronze_path, partition_cols=["_ingested_date"])
+# In Databricks, you would use Auto Loader for streaming ingestion:
+# spark.readStream.format("cloudFiles")
+#   .option("cloudFiles.format", "parquet")
+#   .option("cloudFiles.schemaLocation", "/mnt/schema/yellow_trips")
+#   .load("/mnt/raw/yellow_tripdata_*.parquet")
 ```
 
 ### Silver Layer (Cleaned / Conformed)
 
-**Purpose:** Single source of truth for each entity. Cleaned, deduplicated, typed,
-validated -- but still at the same granularity as the source.
-
-**Principles:**
-- **Deduplication.** Remove exact duplicates and apply business logic for near-
-  duplicates (e.g., keep the latest record per primary key).
-- **Type casting.** Parse dates into proper date types. Cast numeric strings to
-  numbers. Standardize categorical values.
-- **Validation.** Apply data quality rules: non-null primary keys, valid ranges
-  (age between 0 and 120), referential integrity where possible.
-- **Normalization.** Standardize formats: gender values to `male`/`female`/`unknown`,
-  country codes to ISO format, timestamps to UTC.
-- **Derived columns.** Add useful computed fields: `signup_year`, `age_group`,
-  `listening_duration_minutes`.
-- **Quarantine.** Records that fail critical validations are written to a separate
-  `_quarantine` table for investigation, not silently dropped.
+**Purpose:** Single source of truth for each trip type. Cleaned, deduplicated,
+validated, with computed columns added -- but still at individual trip granularity.
 
 **What changes from Bronze:**
-- Duplicates removed
-- Date columns parsed to consistent `YYYY-MM-DD` format
-- Gender values normalized (`m`, `M`, `male`, `Male` all become `male`)
-- Null values handled (filled with defaults or flagged)
+- Trips with null pickup/dropoff times removed
+- Negative fares flagged or removed
+- Computed columns added: `trip_duration_minutes`, `speed_mph`, `is_airport_trip`, `is_rush_hour`
+- Deduplication on natural keys
+- Type casting and validation applied
 - Invalid records quarantined
-- Consistent column naming (snake_case)
+
+**Silver tables:**
+- `silver_yellow_trips` -- Cleaned yellow taxi trips
+- `silver_green_trips` -- Cleaned green taxi trips
+- `silver_fhv_trips` -- Cleaned FHV/rideshare trips
 
 ```python
-# Silver philosophy: clean it, keep it granular
-df = df.drop_duplicates(subset=["user_id"])
-df["signup_date"] = pd.to_datetime(df["signup_date"], format="mixed", dayfirst=False)
-df["gender"] = df["gender"].str.lower().map(GENDER_MAP).fillna("unknown")
+# In Databricks DLT, you would use expectations:
+# @dlt.expect_or_drop("valid_fare", "fare_amount >= 0")
+# @dlt.expect_or_drop("valid_duration", "trip_duration_minutes > 0")
+# @dlt.expect_or_quarantine("reasonable_speed", "speed_mph < 100")
 ```
 
 ### Gold Layer (Business / Aggregated)
 
 **Purpose:** Business-level tables optimized for specific analytical use cases.
-Aggregated, joined, and shaped for dashboards, reports, and ML features.
 
-**Principles:**
-- **Use-case driven.** Each Gold table serves a specific business question or
-  dashboard. Do not create a "general purpose" Gold table.
-- **Pre-aggregated.** Daily metrics, weekly rollups, cohort tables. End users should
-  not need to write complex GROUP BY queries.
-- **Joined and enriched.** Combine data from multiple Silver tables. A listening
-  metric table joins events with users, episodes, and podcasts.
-- **Slowly changing dimensions.** Handle historical changes in dimension attributes
-  (e.g., a podcast changing category).
-- **Optimized for read.** Sorted, partitioned, and columnar for fast analytical
-  queries.
+**Gold tables in this module:**
+- `gold_daily_metrics` -- Daily trip counts, revenue, avg distance by taxi type
+- `gold_zone_analytics` -- Top zones, revenue by borough, trip characteristics per zone
+- `gold_hourly_patterns` -- Hourly distributions, weekday vs weekend, rush hour analysis
+- `gold_weather_impact` -- Trip volume and revenue correlated with weather
 
-**Example Gold tables:**
-- `gold_daily_listening_metrics` -- DAU, total listens, avg completion rate per day
-- `gold_podcast_performance` -- Per-podcast aggregate performance metrics
-- `gold_user_retention_cohorts` -- Cohort retention analysis by signup month
-- `gold_ad_revenue` -- Revenue by advertiser, campaign, ad type, and time period
-
-```python
-# Gold philosophy: answer business questions directly
-daily_metrics = (
-    silver_events
-    .groupby("event_date")
-    .agg(
-        dau=("user_id", "nunique"),
-        total_listens=("event_id", "count"),
-        avg_completion=("completion_rate", "mean"),
-    )
-)
+```sql
+-- In Databricks, Gold tables are often materialized views:
+-- CREATE MATERIALIZED VIEW nyc_taxi.gold.daily_metrics AS
+-- SELECT pickup_date, taxi_type, COUNT(*) as total_trips, ...
+-- FROM nyc_taxi.silver.yellow_trips
+-- GROUP BY pickup_date, taxi_type;
 ```
 
 ---
 
-## Schema Evolution Handling
+## Schema Evolution Handling (NYC Taxi Example)
 
-As source systems evolve, new columns appear. The medallion architecture handles
-this gracefully:
+The NYC TLC data provides a real-world example of schema evolution: the
+`airport_fee` column was added to yellow taxi data starting in 2019. Earlier
+data files do not contain this column.
 
 1. **Bronze:** New columns are automatically captured because we read source files
-   dynamically. The `_source_file` and `_ingested_at` metadata tells us when the
-   new column first appeared.
+   dynamically. The `_source_file` metadata tells us when the new column appeared.
 
-2. **Silver:** Schema evolution requires an explicit decision. Options:
-   - Add the column with null backfill for historical records
-   - Maintain a schema registry that tracks expected vs. actual schemas
-   - Use union-by-name (Parquet default) to merge old and new schemas
+2. **Silver:** Schema evolution requires an explicit decision. In Delta Lake:
+   ```python
+   df.write.format("delta").option("mergeSchema", "true").mode("append").save(path)
+   ```
 
 3. **Gold:** Usually unaffected unless the new column is relevant to a business
-   metric, in which case the Gold table definition is updated.
-
-In Delta Lake, schema evolution is handled with:
-```python
-df.write.format("delta").option("mergeSchema", "true").mode("append").save(path)
-```
-
-In this module (using Parquet + pandas), we simulate schema evolution by detecting
-new columns and using `pd.concat` with `join="outer"` to merge schemas.
+   metric.
 
 ---
 
-## Comparison with Traditional ETL
+## Comparison: Local PySpark vs. Databricks
 
-| Aspect | Traditional ETL | Medallion Architecture |
+| Aspect | This Module (Local PySpark) | Databricks Production |
 |---|---|---|
-| **Data retention** | Source data often discarded after transformation | Bronze retains everything |
-| **Reprocessing** | Requires re-extraction from source systems | Reprocess from Bronze at any time |
-| **Debugging** | Difficult -- intermediate states not saved | Each layer is queryable |
-| **Schema changes** | Often requires pipeline redesign | Handled incrementally per layer |
-| **Team collaboration** | Monolithic pipeline owned by one team | Clear layer ownership |
-| **Testing** | End-to-end only | Each layer testable independently |
-| **Time to insight** | Must wait for full pipeline | Bronze available immediately |
-| **Complexity** | Hidden in one big job | Distributed across clear stages |
-
----
-
-## Databricks Unity Catalog Concepts
-
-While this module uses local files and DuckDB, production medallion architectures
-often run on Databricks with Unity Catalog for governance. Key concepts:
-
-### Three-Level Namespace
-
-```
-catalog.schema.table
-  |       |      |
-  |       |      +-- e.g., gold_daily_metrics
-  |       +--------- e.g., gold, silver, bronze
-  +----------------- e.g., podcast_platform
-```
-
-Example fully qualified names:
-- `podcast_platform.bronze.raw_users`
-- `podcast_platform.silver.clean_users`
-- `podcast_platform.gold.daily_listening_metrics`
-
-### Governance Features
-
-- **Access Control:** Fine-grained permissions at catalog, schema, or table level.
-  Data engineers get write access to bronze/silver; analysts get read-only access
-  to silver/gold.
-- **Data Lineage:** Unity Catalog automatically tracks which tables were used to
-  produce which other tables. You can visualize the full flow from Bronze to Gold.
-- **Audit Logging:** Every query and table access is logged for compliance.
-- **Data Discovery:** Searchable catalog of all tables with descriptions, tags, and
-  ownership information.
-
-### Managed vs. External Tables
-
-- **Managed tables:** Unity Catalog controls both metadata and data files. Dropping
-  the table deletes the data.
-- **External tables:** Unity Catalog manages metadata only. Data lives in your own
-  cloud storage (S3, ADLS, GCS). Dropping the table keeps the data.
-
-For a podcast platform, you might use managed tables for Gold (curated, governed)
-and external tables for Bronze (controlled storage location, retained even if
-catalog metadata changes).
+| **Storage format** | Parquet files on local disk | Delta Lake on cloud storage (S3/ADLS/GCS) |
+| **Compute** | Local SparkSession | Databricks clusters (autoscaling) |
+| **Ingestion** | `spark.read.parquet()` | Auto Loader (`cloudFiles`) with streaming |
+| **Pipeline orchestration** | Run scripts in order | Delta Live Tables (declarative) |
+| **Data quality** | Manual validation code | DLT Expectations (`@dlt.expect`) |
+| **Catalog** | File paths | Unity Catalog (3-level namespace) |
+| **MERGE/Upsert** | DuckDB SQL simulation | Native Delta Lake `MERGE INTO` |
+| **Schema evolution** | Manual `unionByName` | `mergeSchema` option on Delta writes |
+| **Governance** | None | Unity Catalog ACLs, lineage, audit logs |
 
 ---
 
@@ -279,25 +287,25 @@ catalog metadata changes).
 
 ```
 module-06-medallion-architecture/
-  README.md                         # This file
-  exercises.md                      # Hands-on exercises
+  README.md                           # This file
+  exercises.md                        # Hands-on exercises
   solutions/
-    bronze_layer.py                 # Exercise 1: Bronze ingestion
-    silver_users.py                 # Exercise 2: Clean users
-    silver_events.py                # Exercise 3: Clean listening events
-    silver_cdn.py                   # Exercise 4: Clean CDN logs
-    gold_daily_metrics.py           # Exercise 5: Daily listening metrics
-    gold_podcast_performance.py     # Exercise 6: Podcast performance
-    gold_user_retention.py          # Exercise 7: User retention cohorts
-    gold_ad_revenue.py              # Exercise 8: Ad revenue analytics
-    schema_evolution.py             # Exercise 9: Schema evolution
-    merge_upsert.py                 # Exercise 10: MERGE / upsert
+    bronze_layer.py                   # Exercise 1: Ingest raw taxi data
+    silver_yellow_trips.py            # Exercise 2: Clean yellow taxi trips
+    silver_green_trips.py             # Exercise 3: Clean green taxi trips
+    silver_fhv_trips.py              # Exercise 4: Clean FHV/rideshare trips
+    gold_daily_metrics.py             # Exercise 5: Daily trip metrics
+    gold_zone_analytics.py            # Exercise 6: Zone-level analytics
+    gold_hourly_patterns.py           # Exercise 7: Hourly/temporal patterns
+    gold_weather_impact.py            # Exercise 8: Weather impact analysis
+    schema_evolution.py               # Exercise 9: Schema evolution
+    merge_upsert.py                   # Exercise 10: MERGE / upsert
 ```
 
 ## Prerequisites
 
 ```bash
-pip install pandas pyarrow duckdb
+pip install pyspark pyarrow duckdb
 ```
 
 ## Running the Solutions
@@ -309,15 +317,15 @@ Run the solutions in order -- Gold depends on Silver, which depends on Bronze:
 python solutions/bronze_layer.py
 
 # Step 2: Build Silver layer
-python solutions/silver_users.py
-python solutions/silver_events.py
-python solutions/silver_cdn.py
+python solutions/silver_yellow_trips.py
+python solutions/silver_green_trips.py
+python solutions/silver_fhv_trips.py
 
 # Step 3: Build Gold layer
 python solutions/gold_daily_metrics.py
-python solutions/gold_podcast_performance.py
-python solutions/gold_user_retention.py
-python solutions/gold_ad_revenue.py
+python solutions/gold_zone_analytics.py
+python solutions/gold_hourly_patterns.py
+python solutions/gold_weather_impact.py
 
 # Bonus: Schema evolution and upsert patterns
 python solutions/schema_evolution.py
@@ -325,3 +333,4 @@ python solutions/merge_upsert.py
 ```
 
 Each script prints progress information, data quality statistics, and sample output.
+All scripts include comments showing the Databricks DLT / Unity Catalog equivalent.

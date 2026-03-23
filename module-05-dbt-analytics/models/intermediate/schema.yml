@@ -1,45 +1,54 @@
 version: 2
 
 models:
-  - name: int_listens_enriched
+  - name: int_trips_enriched
     description: >
-      Listening events enriched with user, episode, and podcast metadata.
-      This is the central fact model that mart models build on. Includes
-      listen completion percentage as a derived metric.
+      Yellow and green taxi trips enriched with pickup/dropoff zone names,
+      borough info, and derived metrics (trip duration, speed, tip percentage,
+      airport flag). This is the core fact model that mart models build on.
     columns:
-      - name: event_id
-        description: "Unique event identifier"
+      - name: trip_key
+        description: "Unique key across yellow and green trips (taxi_type-trip_id)"
         tests:
           - unique
           - not_null
-      - name: listen_pct
-        description: "Percentage of episode listened (0-100+)"
-      - name: podcast_id
-        description: "Podcast identifier (from episode join)"
-      - name: event_date
-        description: "Date of the listening event"
+      - name: taxi_type
+        description: "Taxi type: yellow or green"
+        tests:
+          - accepted_values:
+              values: ['yellow', 'green']
+      - name: trip_date
+        description: "Date of the trip (from pickup datetime)"
+      - name: pickup_hour
+        description: "Hour of day for pickup (0-23)"
+      - name: trip_duration_minutes
+        description: "Trip duration in minutes (dropoff - pickup)"
+      - name: speed_mph
+        description: "Average speed in MPH (distance / duration)"
+      - name: tip_pct
+        description: "Tip as percentage of fare amount"
+      - name: is_airport_trip
+        description: "True if pickup or dropoff is JFK, LaGuardia, or Newark"
 
-  - name: int_user_sessions
+  - name: int_daily_trip_summary
     description: >
-      User listening sessions derived by detecting gaps of 30+ minutes
-      between consecutive events. Each row is one session.
+      Daily trip aggregation by pickup zone and taxi type. Includes counts,
+      distances, durations, revenue, and airport trip counts. Used by mart
+      models for zone and daily metrics.
     columns:
-      - name: session_id
-        description: "Unique session identifier (user_id + session_num)"
-        tests:
-          - unique
-          - not_null
-      - name: user_id
-        description: "User who had the session"
+      - name: trip_date
+        description: "Calendar date"
         tests:
           - not_null
-      - name: session_start
-        description: "Timestamp of the first event in the session"
-      - name: session_end
-        description: "Timestamp of the last event in the session"
-      - name: events_in_session
-        description: "Number of events in the session"
-      - name: episodes_in_session
-        description: "Number of distinct episodes in the session"
-      - name: total_listened_seconds
-        description: "Total seconds listened in the session"
+      - name: pickup_location_id
+        description: "TLC zone ID for pickup location"
+        tests:
+          - not_null
+      - name: taxi_type
+        description: "Taxi type: yellow or green"
+      - name: trip_count
+        description: "Number of trips"
+      - name: total_revenue
+        description: "Sum of total_amount for all trips"
+      - name: avg_speed_mph
+        description: "Average speed across trips in MPH"

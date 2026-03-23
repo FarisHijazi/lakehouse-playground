@@ -1,67 +1,99 @@
 version: 2
 
 models:
-  - name: mart_daily_listens
+  - name: mart_daily_metrics
     description: >
-      Daily listening activity aggregated by date and podcast.
+      Daily trip and revenue metrics aggregated across all taxi types.
       Used for time-series dashboards and trend analysis.
     columns:
-      - name: event_date
+      - name: trip_date
         description: "Calendar date"
-        tests:
-          - not_null
-      - name: podcast_id
-        description: "Podcast identifier"
-      - name: total_events
-        description: "Total listening events on this date for this podcast"
-      - name: unique_listeners
-        description: "Count of distinct users who listened"
-      - name: avg_listen_pct
-        description: "Average completion percentage"
-
-  - name: mart_podcast_performance
-    description: >
-      Podcast-level performance summary with lifetime and recent metrics.
-      One row per podcast.
-    columns:
-      - name: podcast_id
-        description: "Podcast identifier"
         tests:
           - unique
           - not_null
-      - name: total_listened_hours
-        description: "Total hours listened across all users"
-      - name: completion_rate
-        description: "Percentage of events that were completions"
-      - name: listeners_per_episode
-        description: "Average unique listeners per episode"
+      - name: total_trips
+        description: "Total number of trips on this date"
+      - name: total_revenue
+        description: "Total fare revenue across all trips"
+      - name: avg_distance_miles
+        description: "Average trip distance in miles"
+      - name: avg_tip_pct
+        description: "Average tip as percentage of fare"
+      - name: avg_revenue_per_trip
+        description: "Average revenue per trip"
+      - name: yellow_trips
+        description: "Number of yellow taxi trips"
+      - name: green_trips
+        description: "Number of green taxi trips"
 
-  - name: mart_user_cohorts
+  - name: mart_zone_performance
     description: >
-      User cohort analysis based on signup month. Tracks retention
-      and engagement metrics by cohort and months since signup.
+      Zone-level performance metrics. One row per pickup zone. Answers
+      which zones generate the most trips, revenue, and tips.
     columns:
-      - name: cohort_month
-        description: "Month the user signed up (cohort identifier)"
+      - name: location_id
+        description: "TLC zone identifier"
+        tests:
+          - unique
+          - not_null
+      - name: zone_name
+        description: "Zone name (neighborhood or landmark)"
+      - name: borough
+        description: "NYC borough"
+      - name: total_trips
+        description: "Lifetime total trips originating from this zone"
+      - name: total_revenue
+        description: "Lifetime total revenue from this zone"
+      - name: avg_daily_trips
+        description: "Average trips per active day"
+      - name: trip_volume_rank
+        description: "Rank by total trip volume (1 = busiest)"
+
+  - name: mart_hourly_patterns
+    description: >
+      Hour-of-day and day-of-week trip patterns. Shows how trip volume,
+      fares, tips, and speed vary by time of day and weekday vs weekend.
+    columns:
+      - name: pickup_hour
+        description: "Hour of day (0-23)"
         tests:
           - not_null
-      - name: months_since_signup
-        description: "Number of months between signup and activity"
-      - name: active_users
-        description: "Number of users from this cohort active in this month"
-
-  - name: mart_ad_revenue
-    description: >
-      Ad revenue analysis aggregated by month, advertiser, campaign, and ad type.
-      Includes click-through rates and skip rates.
-    columns:
-      - name: event_month
-        description: "Calendar month of the ad events"
+      - name: pickup_dow
+        description: "Day of week (0=Sunday, 6=Saturday)"
         tests:
           - not_null
-      - name: total_revenue_sar
-        description: "Total revenue in Saudi Riyals"
-      - name: click_through_rate
-        description: "Clicks / Impressions as a percentage"
-      - name: skip_rate
-        description: "Skips / Impressions as a percentage"
+      - name: day_type
+        description: "Weekday or weekend"
+        tests:
+          - accepted_values:
+              values: ['weekday', 'weekend']
+      - name: trip_count
+        description: "Number of trips in this hour/dow combination"
+      - name: avg_speed_mph
+        description: "Average speed -- shows congestion patterns"
+      - name: avg_tip_pct
+        description: "Average tip percentage"
+
+  - name: mart_weather_impact
+    description: >
+      Daily trip metrics joined with weather observations. Enables analysis
+      of how temperature, rain, and snow affect taxi ridership and revenue.
+    columns:
+      - name: trip_date
+        description: "Calendar date"
+        tests:
+          - unique
+          - not_null
+      - name: weather_category
+        description: "Classified weather condition for the day"
+        tests:
+          - accepted_values:
+              values: ['clear', 'light_rain', 'heavy_rain', 'snow', 'extreme_heat', 'extreme_cold']
+      - name: temp_avg_f
+        description: "Average temperature in Fahrenheit"
+      - name: precipitation_in
+        description: "Precipitation in inches"
+      - name: total_trips
+        description: "Total trips on this date"
+      - name: total_revenue
+        description: "Total revenue on this date"

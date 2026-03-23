@@ -1,7 +1,6 @@
 # Module 01 Exercises: Docker & Postgres
 
-Work through these exercises in order. Each builds on the previous one. Resist the
-urge to look at `solutions/solutions.sql` until you have tried each exercise yourself.
+Work through these exercises in order. Each builds on the previous one.
 
 ---
 
@@ -27,10 +26,11 @@ urge to look at `solutions/solutions.sql` until you have tried each exercise you
 
 4. Connect using `psql`:
    ```bash
-   docker compose exec postgres psql -U lakehouse -d podcast_platform
+   docker compose exec postgres psql -U lakehouse -d nyc_taxi
    ```
-5. Run `\dt` to list tables. You should see: `podcasts`, `episodes`, `users`,
-   `listening_events`, `cdn_logs`, `ad_events`.
+5. Run `\dt` to list tables. You should see 8 tables: `taxi_zones`, `vendors`,
+   `rate_codes`, `payment_types`, `fhv_bases`, `yellow_taxi_trips`,
+   `green_taxi_trips`, `fhv_trips`, `daily_weather`.
 
 6. Open pgAdmin at `http://localhost:8080`. Add a server connection:
    - Host: `postgres` (the Docker service name)
@@ -41,173 +41,172 @@ urge to look at `solutions/solutions.sql` until you have tried each exercise you
 ### Checkpoint
 - [ ] Both containers are running (`docker compose ps` shows 2 services)
 - [ ] You can connect to Postgres via psql
-- [ ] You can see the empty tables with `\dt`
+- [ ] You can see all 8 empty tables with `\dt`
 - [ ] pgAdmin is accessible at localhost:8080
 
 ---
 
 ## Exercise 2: Load Raw Data into Postgres
 
-**Goal:** Get the raw data from `/data/raw/` into Postgres tables.
+**Goal:** Get the real NYC TLC data into Postgres tables.
 
-### 2a: Load Podcasts (Warm-up)
+### 2a: Load Dimension Tables (Warm-up)
 
-Write a Python script (or use the provided `load_data.py`) to load `podcasts.json`
-into the `podcasts` table.
+Write a Python script (or use the provided `load_data.py`) to load the small
+CSV dimension tables: `taxi_zone_lookup.csv`, `vendors.csv`, `rate_codes.csv`,
+`payment_types.csv`, `fhv_bases.csv`, and `nyc_weather_2023.csv`.
 
 **Hints:**
-- Use `psycopg2` to connect: `psycopg2.connect(host='localhost', port=5432, user='lakehouse', password='lakehouse123', dbname='podcast_platform')`
-- Read the JSON file, iterate rows, INSERT each one
-- Or use `psycopg2.extras.execute_values()` for batch inserts
+- Use `psycopg2` to connect: `psycopg2.connect(host='localhost', port=5432, user='lakehouse', password='lakehouse123', dbname='nyc_taxi')`
+- Read each CSV, iterate rows, use `COPY` or `execute_values()` for batch loading
 
 **Verify:**
 ```sql
-SELECT COUNT(*) FROM podcasts;
--- Expected: 10
+SELECT COUNT(*) FROM taxi_zones;
+-- Expected: 265
 
-SELECT podcast_id, name_en, category FROM podcasts LIMIT 5;
+SELECT borough, COUNT(*) FROM taxi_zones GROUP BY borough ORDER BY COUNT(*) DESC;
+-- Manhattan should have the most zones
+
+SELECT * FROM vendors;
+SELECT * FROM rate_codes;
+SELECT * FROM payment_types;
 ```
 
-### 2b: Load Episodes
+### 2b: Load Yellow Taxi Trips (The Big One)
 
-Load `episodes.json` into the `episodes` table.
+Load the yellow taxi Parquet files into `yellow_taxi_trips`. This is millions of rows.
 
-**Watch out for:** The `published_at` field has format `'2019-03-15 00:00:00'` --
-you may need to parse it as a timestamp.
-
-**Verify:**
-```sql
-SELECT COUNT(*) FROM episodes;
--- Expected: 784
-
-SELECT podcast_id, COUNT(*) FROM episodes GROUP BY podcast_id ORDER BY COUNT(*) DESC;
-```
-
-### 2c: Load Users (This is where it gets real)
-
-Load `users.csv` into the `users` table. The raw data is intentionally messy:
-
-- **Date formats are inconsistent:** `2024-09-10`, `23/09/2022`, `2022-09-21T00:00:00`, `03-09-2019`
-- **Gender values are inconsistent:** `m`, `male`, `M`, `f`, `female`, `F`
-- **Some ages are missing** (empty string)
-- **Some cities are missing** (empty string)
-- **Subscription types need normalization:** `premium_annual` should map to `premium`
-
-Your script must handle all of this. This is what real data engineering looks like.
-
-**Verify:**
-```sql
-SELECT COUNT(*) FROM users;
--- Expected: 5000
-
--- Check gender was normalized
-SELECT gender, COUNT(*) FROM users GROUP BY gender ORDER BY COUNT(*) DESC;
--- Should only have 'm' and 'f'
-
--- Check subscription was normalized
-SELECT subscription_type, COUNT(*) FROM users GROUP BY subscription_type;
--- Should only have 'free', 'premium', 'trial'
-```
-
-### 2d: Load Listening Events (Bulk loading)
-
-Load all JSONL files from `listening_events/` directory. There are ~2500 files
-with a total of ~200k events.
-
-**Performance challenge:** Loading 200k rows one-by-one with INSERT is slow.
-Try these approaches and compare:
-
-1. **Naive:** One INSERT per row. Time it.
-2. **Batch:** Use `execute_values()` with batches of 1000. Time it.
-3. **COPY:** Use `copy_expert()` with StringIO. Time it.
+**Performance challenge:** Try these approaches and compare:
+1. **Naive:** Read parquet with pandas, iterate rows, INSERT each one. Time it.
+2. **Batch:** Use `execute_values()` with batches of 5000. Time it.
+3. **COPY:** Use `copy_expert()` with StringIO buffer. Time it.
 
 You should see a 10-50x speedup from naive to COPY.
 
+**Key learning:** The Parquet column names don't match the Postgres columns exactly
+(e.g., `VendorID` vs `vendor_id`, `PULocationID` vs `pu_location_id`). Your loader
+needs a column mapping.
+
 **Verify:**
 ```sql
-SELECT COUNT(*) FROM listening_events;
--- Expected: ~204,144
+SELECT COUNT(*) FROM yellow_taxi_trips;
+-- Expected: 3M+ (depends on how many months you downloaded)
 
-SELECT event_type, COUNT(*) FROM listening_events GROUP BY event_type ORDER BY COUNT(*) DESC;
+-- Check for data quality issues (these exist in real data!)
+SELECT COUNT(*) FROM yellow_taxi_trips WHERE fare_amount < 0;
+SELECT COUNT(*) FROM yellow_taxi_trips WHERE passenger_count IS NULL;
+SELECT COUNT(*) FROM yellow_taxi_trips WHERE trip_distance = 0 AND fare_amount > 0;
 ```
 
-### 2e: Load CDN Logs and Ad Events
+### 2c: Load Green Taxi and FHV Trips
 
-Load the remaining tables:
-- `cdn_logs.csv` -> `cdn_logs` (50k rows)
-- `ad_events.json` -> `ad_events` (~18k rows)
+Load the remaining trip data:
+- `green_tripdata_*.parquet` → `green_taxi_trips`
+- `fhvhv_tripdata_*.parquet` → `fhv_trips`
+
+**Watch out for:** Different schemas across these three datasets. Green taxis have
+`lpep_pickup_datetime` (not `tpep_`), `ehail_fee`, and `trip_type`. FHV has a
+completely different structure (no fare breakdown, but has `driver_pay`, `tips`, etc.).
 
 **Verify:**
 ```sql
-SELECT COUNT(*) FROM cdn_logs;
-SELECT COUNT(*) FROM ad_events;
+SELECT COUNT(*) FROM green_taxi_trips;
+SELECT COUNT(*) FROM fhv_trips;
+
+-- Compare schemas
+SELECT column_name, data_type FROM information_schema.columns
+WHERE table_name = 'yellow_taxi_trips' ORDER BY ordinal_position;
+
+SELECT column_name, data_type FROM information_schema.columns
+WHERE table_name = 'fhv_trips' ORDER BY ordinal_position;
+```
+
+### 2d: Load Weather Data
+
+Load `nyc_weather_2023.csv` into `daily_weather`.
+
+**Verify:**
+```sql
+SELECT COUNT(*) FROM daily_weather;
+-- Expected: 365
+
+SELECT * FROM daily_weather ORDER BY precipitation_in DESC LIMIT 5;
 ```
 
 ### Checkpoint
-- [ ] All 6 tables have data
-- [ ] Users were cleaned (consistent genders, normalized subscriptions, parsed dates)
-- [ ] You understand the difference between INSERT, batch INSERT, and COPY performance
+- [ ] All 8 tables have data
+- [ ] You understand the COPY performance advantage over INSERT
+- [ ] You handled the column name mapping between Parquet and Postgres
+- [ ] You noticed the real data quality issues (nulls, negatives, zeros)
 
 ---
 
 ## Exercise 3: Analytical SQL Queries
 
-**Goal:** Write SQL queries that answer real business questions. These are the kinds
-of queries a data engineering manager would ask you to support.
+**Goal:** Write SQL queries that answer real business questions about NYC taxi operations.
 
-### 3a: Top 10 Episodes by Total Listen Time
+### 3a: Revenue by Borough
 
-Find the 10 episodes with the most total listened seconds. Include the podcast name
-and episode title.
+Calculate total fare revenue by pickup borough. Join `yellow_taxi_trips` with
+`taxi_zones` to get borough names.
 
-Expected output columns: `podcast_name`, `episode_title`, `total_listened_seconds`, `listener_count`
+Expected columns: `borough`, `total_trips`, `total_revenue`, `avg_fare`
 
-### 3b: Daily Active Listeners (DAL)
+Which borough generates the most taxi revenue?
 
-Calculate the number of unique listeners per day. This is the most common engagement
-metric for any content platform.
+### 3b: Hourly Trip Patterns
 
-Expected output columns: `day`, `unique_listeners`
+Calculate the average number of yellow taxi trips by hour of day. What are the peak
+hours? How does this compare to what you'd expect?
 
-Order by day. What trends do you see?
+Expected columns: `hour_of_day`, `avg_daily_trips`, `avg_fare`, `avg_tip`
 
-### 3c: User Retention - Week 1 vs Week 5
+### 3c: Weather Impact on Taxi Demand
 
-For users who signed up in 2022, calculate:
-- How many had at least one listening event in their first 7 days?
-- How many had at least one listening event in days 29-35 (week 5)?
-- What is the retention rate (week 5 listeners / week 1 listeners)?
+Join `yellow_taxi_trips` with `daily_weather` (by pickup date). Compare trip volume
+and average fares on:
+- Rainy days (precipitation > 0.1 inches) vs dry days
+- Snow days (snowfall > 0) vs no-snow days
+- Cold days (temp_avg < 32F) vs warm days (temp_avg > 70F)
 
-This is a simplified cohort retention analysis.
+Do New Yorkers take more taxis when it rains?
 
-### 3d: Podcast Completion Rate
+### 3d: Tipping Analysis by Payment Type
 
-For each podcast, calculate the percentage of listening events that were "complete"
-events. Which podcasts have the highest completion rate? Does episode duration
-correlate with completion rate?
+Calculate average tip percentage (`tip_amount / fare_amount`) grouped by payment type.
+Join with `payment_types` for readable names.
 
-Expected output columns: `podcast_name`, `total_events`, `complete_events`, `completion_rate`
+**Important insight:** Credit card tips are recorded, but cash tips are NOT (they show
+as $0). This is a classic data engineering gotcha — the data looks like cash riders
+don't tip, but it's a measurement issue, not a behavioral one.
 
-### 3e: Revenue by Advertiser
+### 3e: Airport Trip Analysis
 
-Calculate total ad revenue (in SAR) by advertiser. Also calculate:
-- Number of impressions
-- Number of clicks
-- Click-through rate (clicks / impressions)
-- Average revenue per impression
+Analyze trips to/from the three NYC airports. The zone IDs are:
+- JFK Airport: location_id = 132
+- LaGuardia Airport: location_id = 138
+- Newark Airport: location_id = 1
 
-Order by total revenue descending.
+Calculate for each airport:
+- Number of pickups and dropoffs
+- Average fare, tip, and total
+- Average trip distance
+- Most common pickup/dropoff zone for the return trip
 
-### 3f: Platform Distribution Over Time
+### 3f: Uber vs Lyft Comparison
 
-For each quarter (YYYY-Q format), calculate the percentage of listening events from
-each platform (ios, android, web, car_play, smart_speaker). How has the platform
-mix shifted over time?
+Using the `fhv_trips` table, compare Uber (HV0003) vs Lyft (HV0005):
+- Total trips
+- Average trip miles and time
+- Average base passenger fare
+- Average tips and driver pay
+- Percentage of shared rides (`shared_request_flag = 'Y'`)
 
 ### Checkpoint
-- [ ] You can write JOINs across the dimension and fact tables
-- [ ] You understand GROUP BY, aggregate functions, and window functions
-- [ ] You can calculate retention and conversion metrics
+- [ ] You can write JOINs across fact and dimension tables
+- [ ] You understand GROUP BY, aggregate functions, and date/time extraction
+- [ ] You noticed the cash tip measurement issue (real-world data literacy!)
 
 ---
 
@@ -221,9 +220,9 @@ Run this query with `EXPLAIN ANALYZE`:
 ```sql
 EXPLAIN ANALYZE
 SELECT COUNT(*)
-FROM listening_events
-WHERE event_timestamp >= '2023-01-01'
-  AND event_timestamp < '2024-01-01';
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2023-01-01'
+  AND tpep_pickup_datetime < '2023-02-01';
 ```
 
 Answer these questions:
@@ -233,35 +232,35 @@ Answer these questions:
 
 ### 4b: Compare With and Without Indexes
 
-Drop the timestamp index and re-run the query:
+Drop the pickup datetime index and re-run the query:
 ```sql
-DROP INDEX idx_events_timestamp;
+DROP INDEX idx_yellow_pickup_dt;
 
 EXPLAIN ANALYZE
 SELECT COUNT(*)
-FROM listening_events
-WHERE event_timestamp >= '2023-01-01'
-  AND event_timestamp < '2024-01-01';
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2023-01-01'
+  AND tpep_pickup_datetime < '2023-02-01';
 ```
 
 Now recreate it:
 ```sql
-CREATE INDEX idx_events_timestamp ON listening_events(event_timestamp);
+CREATE INDEX idx_yellow_pickup_dt ON yellow_taxi_trips(tpep_pickup_datetime);
 ```
 
 Compare the two plans. How much faster is the indexed version?
 
 ### 4c: Composite Index Design
 
-Consider this query that runs frequently in your analytics dashboard:
+Consider this query that a revenue dashboard runs frequently:
 ```sql
-SELECT episode_id, COUNT(*) as plays, SUM(listened_seconds) as total_seconds
-FROM listening_events
-WHERE event_type = 'play'
-  AND event_timestamp >= '2023-06-01'
-  AND event_timestamp < '2023-07-01'
-GROUP BY episode_id
-ORDER BY total_seconds DESC
+SELECT pu_location_id, COUNT(*) as trips, SUM(total_amount) as revenue
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2023-01-01'
+  AND tpep_pickup_datetime < '2023-02-01'
+  AND payment_type = 1  -- credit card only
+GROUP BY pu_location_id
+ORDER BY revenue DESC
 LIMIT 20;
 ```
 
@@ -269,94 +268,83 @@ LIMIT 20;
 2. Create a composite index that would help this query. Think about column order.
 3. Run `EXPLAIN ANALYZE` again and compare.
 
-**Hint:** The most selective column should generally come first in a composite index.
+### 4d: Zone Lookup Join Optimization
 
-### 4d: Partial Index
-
-CDN error analysis is a common SRE query, but most CDN logs have no errors. A partial
-index is perfect here:
-
-```sql
--- This index already exists in init.sql:
--- CREATE INDEX idx_cdn_error_type ON cdn_logs(error_type) WHERE error_type IS NOT NULL;
-```
-
-Compare the query plan for:
+This common query joins trips with zones — but zones is small (265 rows):
 ```sql
 EXPLAIN ANALYZE
-SELECT error_type, COUNT(*), AVG(rebuffer_ratio)
-FROM cdn_logs
-WHERE error_type IS NOT NULL
-GROUP BY error_type;
+SELECT z.borough, z.zone, COUNT(*) as trips
+FROM yellow_taxi_trips t
+JOIN taxi_zones z ON t.pu_location_id = z.location_id
+WHERE t.tpep_pickup_datetime >= '2023-01-01'
+  AND t.tpep_pickup_datetime < '2023-02-01'
+GROUP BY z.borough, z.zone
+ORDER BY trips DESC
+LIMIT 20;
 ```
 
-Drop the partial index, replace it with a full index, and compare the size:
-```sql
-SELECT pg_size_pretty(pg_relation_size('idx_cdn_error_type'));
-```
+Is Postgres using a Hash Join or Nested Loop? For small dimension tables, which is better?
 
 ### Checkpoint
 - [ ] You can read EXPLAIN ANALYZE output (node types, costs, actual times, rows)
 - [ ] You understand when Postgres chooses Seq Scan vs Index Scan
 - [ ] You can design composite indexes for multi-column filter queries
-- [ ] You know when partial indexes save space
+- [ ] You understand join strategies (Hash Join vs Nested Loop vs Merge Join)
 
 ---
 
 ## Exercise 5: Views for Analytics
 
 **Goal:** Create views that encapsulate business logic. In a real platform, downstream
-teams (product, growth, finance) query views -- not raw tables.
+teams query views — not raw tables.
 
-### 5a: Podcast Performance Dashboard View
+### 5a: Daily Trip Summary View
 
-Create a view `v_podcast_performance` that shows, for each podcast:
-- Podcast name (Arabic and English)
-- Category
-- Number of episodes
-- Total listening events
-- Total listened hours
-- Unique listeners
-- Average completion rate
-- Most recent episode date
-
-This is the view a product manager would query every morning.
-
-### 5b: Daily Metrics View
-
-Create a view `v_daily_metrics` that shows, for each day:
-- Unique listeners (DAL)
-- Total listening events
-- Total listened hours
-- New users (signed up that day)
-- Revenue from ads
+Create a view `v_daily_trip_summary` that shows, for each day:
+- Total trips (yellow + green + FHV)
+- Total revenue (yellow + green only — FHV doesn't have the same fare breakdown)
+- Average fare amount
+- Average tip percentage (credit card trips only)
+- Average trip distance
 
 This is the view that feeds the executive dashboard.
 
-### 5c: User Segments View
+### 5b: Zone Performance View
 
-Create a view `v_user_segments` that classifies each user into engagement segments:
-- **Power User:** 50+ listening events in the last 90 days
-- **Regular:** 10-49 events in the last 90 days
-- **Casual:** 1-9 events in the last 90 days
-- **Dormant:** 0 events in the last 90 days
+Create a view `v_zone_performance` that shows, for each taxi zone:
+- Borough
+- Zone name
+- Total pickups and dropoffs
+- Average fare and tip
+- Most common payment type
+- Average trip distance from that zone
 
-Include: `user_id`, `name`, `segment`, `total_events_90d`, `last_listen_date`,
-`favorite_podcast` (the one they listened to most)
+### 5c: Hourly Demand View
 
-### 5d: CDN Health View
+Create a view `v_hourly_demand` that shows, for each hour of each day:
+- Trip count
+- Average fare
+- Whether it's a weekday or weekend
+- Whether it's rush hour (7-9 AM or 4-7 PM on weekdays)
 
-Create a view `v_cdn_health` that shows daily CDN performance:
-- Error rate (% of requests with errors)
-- Average startup time
-- Average rebuffer ratio
-- P95 startup time (use `PERCENTILE_CONT`)
-- Worst performing CDN node
+This view would feed a real-time demand forecasting model.
+
+### 5d: Data Quality View
+
+Create a view `v_data_quality_issues` that flags problematic records:
+- Trips where `fare_amount < 0`
+- Trips where `trip_distance = 0` and `fare_amount > 10`
+- Trips where `passenger_count` is null or 0
+- Trips where pickup datetime > dropoff datetime
+- Trips with `total_amount > 500` (outliers)
+- Trips with `rate_code_id = 99` (unknown)
+
+This is the view a data quality team would monitor.
 
 ### Checkpoint
 - [ ] Your views produce correct results (spot-check against raw queries)
 - [ ] You understand the difference between views and materialized views
-- [ ] You could explain to a product manager what each view shows
+- [ ] You could explain to a stakeholder what each view shows
 
 ---
 
@@ -364,15 +352,15 @@ Create a view `v_cdn_health` that shows daily CDN performance:
 
 After completing all exercises, reflect on these questions:
 
-1. **Schema evolution:** If the platform adds a "bookmarks" feature, what tables
-   and indexes would you add? How do you alter the schema without downtime?
+1. **Schema evolution:** The TLC added `airport_fee` in 2019 and `congestion_surcharge`
+   earlier. How do you handle Parquet files from different years with different schemas?
 
-2. **Data quality:** The users table has messy data. In production, where should
-   data cleaning happen -- in the ingestion script, in the database (CHECK constraints),
-   or in a transformation layer (dbt)? What are the tradeoffs?
+2. **Data quality:** The real data has negative fares, null passengers, and impossible
+   speeds. In production, where should cleaning happen — in the ingestion script, in
+   the database (CHECK constraints), or in a transformation layer (dbt)? What are the tradeoffs?
 
-3. **Scale:** The listening_events table has 200k rows. At 1M events/day, what
-   changes would you make? (Hint: partitioning, archival, pre-aggregation.)
+3. **Scale:** Yellow taxi alone is ~3M rows/month. At that volume, what changes would
+   you make? (Hint: table partitioning, parallel COPY, connection pooling.)
 
-4. **Observability:** How would you monitor this database in production? What
-   metrics would you alert on?
+4. **Observability:** How would you monitor this database in production? What metrics
+   would you alert on? (Row count drops, load latency, query performance degradation.)

@@ -9,437 +9,429 @@
 
 
 -- =============================================================================
--- Exercise 5a: Top 10 Podcasts by Total Listening Hours (Per Month)
+-- Exercise 5a: Revenue by Borough and Zone
 -- =============================================================================
--- Approach:
---   1. Join fact_listens -> dim_episodes -> dim_podcasts to get podcast names.
---   2. Join to dim_dates to extract year-month.
---   3. Aggregate listened_seconds per podcast per month.
---   4. Use RANK() window function to find the top 10 each month.
+-- For each borough, find the top 10 pickup zones by total fare revenue.
+-- Uses a window function (RANK) to pick the top zones within each borough.
 -- =============================================================================
 
-WITH monthly_hours AS (
+WITH zone_revenue AS (
     SELECT
-        d.year,
-        d.month,
-        d.month_name,
-        p.name_en                             AS podcast_name,
-        -- Convert seconds to hours for readability
-        ROUND(SUM(f.listened_seconds) / 3600.0, 1) AS total_hours
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-    JOIN dim_dates    d  ON f.date_key    = d.date_key
-    GROUP BY d.year, d.month, d.month_name, p.name_en
+        z.borough,
+        z.zone,
+        COUNT(*)                              AS trip_count,
+        ROUND(SUM(f.total_amount), 2)         AS total_revenue,
+        ROUND(AVG(f.fare_amount), 2)          AS avg_fare,
+        ROUND(AVG(f.tip_amount), 2)           AS avg_tip
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    GROUP BY z.borough, z.zone
 ),
 ranked AS (
     SELECT
         *,
-        -- RANK() so ties get the same rank; allows >10 rows if there are ties
         RANK() OVER (
-            PARTITION BY year, month
-            ORDER BY total_hours DESC
-        ) AS rank_in_month
-    FROM monthly_hours
+            PARTITION BY borough
+            ORDER BY total_revenue DESC
+        ) AS rank_in_borough
+    FROM zone_revenue
 )
 SELECT
-    year,
-    month,
-    month_name,
-    podcast_name,
-    total_hours,
-    rank_in_month
+    borough,
+    zone,
+    trip_count,
+    total_revenue,
+    avg_fare,
+    avg_tip,
+    rank_in_borough
 FROM ranked
-WHERE rank_in_month <= 10
-ORDER BY year, month, rank_in_month;
+WHERE rank_in_borough <= 10
+ORDER BY borough, rank_in_borough;
 
 
 -- =============================================================================
--- Exercise 5b: User Cohort Retention
+-- Exercise 5b: Trip Patterns by Hour and Day
 -- =============================================================================
--- Approach:
---   1. Define each user's cohort as their signup month (from dim_users).
---   2. For each listening event, calculate how many months after signup it occurred.
---   3. Count distinct active users per cohort per month-offset.
---   4. Divide by cohort size to get retention rate.
---
--- This is a classic cohort retention analysis used by product teams to measure
--- how well they retain users over time.
--- =============================================================================
-
-WITH user_cohorts AS (
-    -- Assign each user to their signup month cohort
-    SELECT
-        user_key,
-        DATE_TRUNC('month', signup_date)::DATE AS cohort_month
-    FROM dim_users
-    WHERE signup_date IS NOT NULL
-),
-cohort_sizes AS (
-    -- Count users per cohort (denominator for retention rate)
-    SELECT
-        cohort_month,
-        COUNT(*) AS cohort_size
-    FROM user_cohorts
-    GROUP BY cohort_month
-),
-user_activity AS (
-    -- For each user listen, calculate months since signup
-    SELECT DISTINCT
-        uc.cohort_month,
-        f.user_key,
-        -- DATEDIFF in months gives us the "months since signup" offset
-        DATEDIFF('month', uc.cohort_month, f.event_date) AS months_since_signup
-    FROM fact_listens f
-    JOIN user_cohorts uc ON f.user_key = uc.user_key
-    WHERE f.event_date >= uc.cohort_month
-)
-SELECT
-    ua.cohort_month,
-    ua.months_since_signup,
-    cs.cohort_size,
-    COUNT(DISTINCT ua.user_key) AS active_users,
-    ROUND(COUNT(DISTINCT ua.user_key)::DOUBLE / cs.cohort_size, 4) AS retention_rate
-FROM user_activity ua
-JOIN cohort_sizes cs ON ua.cohort_month = cs.cohort_month
-WHERE ua.months_since_signup <= 12   -- Show up to 12 months of retention
-GROUP BY ua.cohort_month, ua.months_since_signup, cs.cohort_size
-ORDER BY ua.cohort_month, ua.months_since_signup;
-
-
--- =============================================================================
--- Exercise 5c: Ad Revenue by Show
--- =============================================================================
--- Approach:
---   1. Join fact_ad_events to fact_listens via event_id to find which episode
---      each ad was attached to.
---   2. Join through dim_episodes to dim_podcasts to get podcast names.
---   3. Calculate total revenue, impression count, click count, CTR, and RPM.
---
--- Note: RPM (Revenue Per Mille) = revenue per 1000 impressions.
--- CTR (Click-Through Rate) = clicks / impressions.
--- =============================================================================
-
-WITH ad_attribution AS (
-    -- Link each ad event to its podcast through the listening event chain:
-    -- ad_event -> listening_event (event_id) -> episode -> podcast
-    SELECT
-        a.ad_event_id,
-        a.action,
-        a.revenue_sar,
-        a.advertiser,
-        p.name_en AS podcast_name,
-        p.category
-    FROM fact_ad_events a
-    -- Join to fact_listens to find which episode the ad was played during
-    JOIN fact_listens fl ON a.event_id = fl.event_id
-    -- Walk up the dimension chain to get podcast info
-    JOIN dim_episodes ep ON fl.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-)
-SELECT
-    podcast_name,
-    category,
-    -- Total revenue in SAR
-    ROUND(SUM(revenue_sar), 2)                                  AS total_revenue_sar,
-    -- Count impressions (all ad views)
-    COUNT(*) FILTER (WHERE action = 'impression')               AS impressions,
-    -- Count clicks
-    COUNT(*) FILTER (WHERE action = 'click')                    AS clicks,
-    -- Click-through rate: what percentage of impressions led to a click
-    ROUND(
-        COUNT(*) FILTER (WHERE action = 'click')::DOUBLE /
-        NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0) * 100,
-        2
-    )                                                           AS ctr_pct,
-    -- Revenue per 1000 impressions
-    ROUND(
-        SUM(revenue_sar) /
-        NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0) * 1000,
-        2
-    )                                                           AS rpm_sar
-FROM ad_attribution
-GROUP BY podcast_name, category
-ORDER BY total_revenue_sar DESC;
-
-
--- =============================================================================
--- Exercise 5d: Peak Listening Hours
--- =============================================================================
--- Approach:
---   1. Extract day_of_week and hour_of_day from event_timestamp.
---   2. Aggregate total listens and average listened_seconds.
---   3. Result is "heatmap-ready": rows are day-hour combinations.
---
--- This tells the business when users are most active so they can schedule
--- new episode releases and ad campaigns.
+-- Heatmap-ready dataset: trip volume by hour of day and day of week.
+-- This tells the business when demand peaks so they can optimise fleet
+-- allocation and surge pricing.
 -- =============================================================================
 
 SELECT
     d.day_of_week,
     d.day_name,
-    EXTRACT(HOUR FROM f.event_timestamp)::INTEGER AS hour_of_day,
-    COUNT(*)                                       AS total_listens,
-    ROUND(AVG(f.listened_seconds), 0)              AS avg_listened_seconds
-FROM fact_listens f
-JOIN dim_dates d ON f.date_key = d.date_key
+    EXTRACT(HOUR FROM f.pickup_datetime)::INTEGER AS hour_of_day,
+    COUNT(*)                                       AS total_trips,
+    ROUND(AVG(f.fare_amount), 2)                   AS avg_fare,
+    ROUND(AVG(f.trip_distance), 2)                 AS avg_distance
+FROM fact_yellow_trips f
+JOIN dim_date d ON f.pickup_date_key = d.date_key
 GROUP BY d.day_of_week, d.day_name, hour_of_day
 ORDER BY d.day_of_week, hour_of_day;
 
 
 -- =============================================================================
--- Exercise 5e: Streaming Quality by ISP
+-- Exercise 5c: Weather Impact on Trip Volume
 -- =============================================================================
--- Approach:
---   1. Aggregate CDN quality metrics per ISP.
---   2. Calculate error rate as the percentage of requests with non-null error_type.
+-- Join trips to daily weather data. Compare trip counts, fares, and tips
+-- across weather categories (Snow, Rain, Clear).
 --
--- This helps the platform team identify which ISPs have the worst streaming
--- experience so they can work with CDN providers to improve routing.
+-- Hypothesis: bad weather increases demand (people avoid walking) but may
+-- also decrease supply (fewer drivers), leading to higher fares.
 -- =============================================================================
 
+WITH daily_trips AS (
+    SELECT
+        CAST(f.pickup_datetime AS DATE) AS trip_date,
+        COUNT(*)                         AS trip_count,
+        ROUND(AVG(f.fare_amount), 2)     AS avg_fare,
+        ROUND(AVG(f.tip_amount), 2)      AS avg_tip,
+        ROUND(AVG(f.trip_distance), 2)   AS avg_distance
+    FROM fact_yellow_trips f
+    GROUP BY CAST(f.pickup_datetime AS DATE)
+)
 SELECT
-    isp,
-    COUNT(*)                                                    AS total_requests,
-    ROUND(AVG(startup_time_ms), 0)                              AS avg_startup_ms,
-    ROUND(AVG(rebuffer_ratio), 4)                               AS avg_rebuffer_ratio,
-    -- Error rate: percentage of requests that had any error
+    w.weather_category,
+    COUNT(*)                                    AS num_days,
+    ROUND(AVG(dt.trip_count), 0)                AS avg_daily_trips,
+    ROUND(AVG(dt.avg_fare), 2)                  AS avg_fare,
+    ROUND(AVG(dt.avg_tip), 2)                   AS avg_tip,
+    ROUND(AVG(dt.avg_distance), 2)              AS avg_distance,
+    ROUND(AVG(w.temp_avg), 1)                   AS avg_temperature,
+    ROUND(AVG(w.precipitation), 2)              AS avg_precipitation
+FROM daily_trips dt
+JOIN dim_weather w ON dt.trip_date = w.date
+GROUP BY w.weather_category
+ORDER BY avg_daily_trips DESC;
+
+
+-- =============================================================================
+-- Exercise 5d: Uber vs Lyft vs Taxi Comparison
+-- =============================================================================
+-- Compare for-hire vehicles (FHV) with yellow and green taxis.
+-- FHV data is grouped by base company (Uber, Lyft, etc.).
+--
+-- Note: FHV trips do not include fare data, so we compare on trip volume
+-- and duration only. Yellow/green taxis provide full fare breakdowns.
+-- =============================================================================
+
+-- Part 1: Service type summary
+WITH yellow_summary AS (
+    SELECT
+        'Yellow Taxi'                             AS service_type,
+        COUNT(*)                                  AS total_trips,
+        ROUND(AVG(trip_duration_minutes), 1)      AS avg_duration_min,
+        ROUND(AVG(fare_amount), 2)                AS avg_fare
+    FROM fact_yellow_trips
+),
+green_summary AS (
+    SELECT
+        'Green Taxi'                              AS service_type,
+        COUNT(*)                                  AS total_trips,
+        ROUND(AVG(trip_duration_minutes), 1)      AS avg_duration_min,
+        ROUND(AVG(fare_amount), 2)                AS avg_fare
+    FROM fact_green_trips
+),
+fhv_summary AS (
+    SELECT
+        COALESCE(b.base_type, 'Unknown')          AS service_type,
+        COUNT(*)                                  AS total_trips,
+        ROUND(AVG(f.trip_duration_minutes), 1)    AS avg_duration_min,
+        NULL::DOUBLE                              AS avg_fare
+    FROM fact_fhv_trips f
+    LEFT JOIN dim_fhv_bases b ON f.dispatching_base_num = b.base_number
+    GROUP BY b.base_type
+)
+SELECT * FROM yellow_summary
+UNION ALL
+SELECT * FROM green_summary
+UNION ALL
+SELECT * FROM fhv_summary
+ORDER BY total_trips DESC;
+
+-- Part 2: Top pickup zones by service type
+WITH fhv_zones AS (
+    SELECT
+        COALESCE(b.base_type, 'FHV') AS service_type,
+        z.borough,
+        z.zone,
+        COUNT(*) AS trip_count
+    FROM fact_fhv_trips f
+    LEFT JOIN dim_fhv_bases b ON f.dispatching_base_num = b.base_number
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    GROUP BY b.base_type, z.borough, z.zone
+),
+yellow_zones AS (
+    SELECT
+        'Yellow Taxi' AS service_type,
+        z.borough,
+        z.zone,
+        COUNT(*) AS trip_count
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    GROUP BY z.borough, z.zone
+),
+all_zones AS (
+    SELECT * FROM fhv_zones
+    UNION ALL
+    SELECT * FROM yellow_zones
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY service_type
+            ORDER BY trip_count DESC
+        ) AS rn
+    FROM all_zones
+)
+SELECT service_type, borough, zone, trip_count
+FROM ranked
+WHERE rn <= 10
+ORDER BY service_type, rn;
+
+
+-- =============================================================================
+-- Exercise 5e: Tip Analysis by Payment Type
+-- =============================================================================
+-- Analyse tipping behaviour across payment types.
+-- Key insight: cash tips are often unreported, so credit card tips are the
+-- most reliable indicator of tipping behaviour.
+-- =============================================================================
+
+-- Tip statistics by payment type
+SELECT
+    pt.payment_type_name,
+    COUNT(*)                                           AS trip_count,
+    ROUND(AVG(f.tip_amount), 2)                        AS avg_tip,
+    ROUND(AVG(
+        CASE WHEN f.fare_amount > 0
+             THEN f.tip_amount / f.fare_amount * 100
+             ELSE 0
+        END
+    ), 1)                                              AS avg_tip_pct,
+    -- Tip distribution: what fraction of trips have any tip at all
     ROUND(
-        COUNT(*) FILTER (WHERE error_type IS NOT NULL AND error_type != '')::DOUBLE
+        COUNT(*) FILTER (WHERE f.tip_amount > 0)::DOUBLE
         / COUNT(*) * 100,
-        2
-    )                                                           AS error_rate_pct,
-    ROUND(AVG(bytes_transferred) / (1024.0 * 1024.0), 1)       AS avg_mb_transferred
-FROM fact_cdn_quality
-GROUP BY isp
-ORDER BY total_requests DESC;
+        1
+    )                                                  AS pct_trips_with_tip,
+    ROUND(AVG(f.fare_amount), 2)                       AS avg_fare,
+    ROUND(AVG(f.trip_distance), 2)                     AS avg_distance
+FROM fact_yellow_trips f
+JOIN dim_payment_types pt ON f.payment_type_id = pt.payment_type_id
+GROUP BY pt.payment_type_name
+ORDER BY trip_count DESC;
+
+-- Tip percentage by distance bucket (credit card only, for reliable tip data)
+SELECT
+    CASE
+        WHEN trip_distance < 1  THEN '0-1 mi'
+        WHEN trip_distance < 3  THEN '1-3 mi'
+        WHEN trip_distance < 5  THEN '3-5 mi'
+        WHEN trip_distance < 10 THEN '5-10 mi'
+        WHEN trip_distance < 20 THEN '10-20 mi'
+        ELSE '20+ mi'
+    END AS distance_bucket,
+    COUNT(*)                                  AS trip_count,
+    ROUND(AVG(tip_amount), 2)                 AS avg_tip,
+    ROUND(AVG(
+        CASE WHEN fare_amount > 0
+             THEN tip_amount / fare_amount * 100
+             ELSE 0
+        END
+    ), 1)                                     AS avg_tip_pct
+FROM fact_yellow_trips
+WHERE payment_type_id = 1   -- Credit card only
+  AND fare_amount > 0
+GROUP BY distance_bucket
+ORDER BY
+    CASE distance_bucket
+        WHEN '0-1 mi'  THEN 1
+        WHEN '1-3 mi'  THEN 2
+        WHEN '3-5 mi'  THEN 3
+        WHEN '5-10 mi' THEN 4
+        WHEN '10-20 mi' THEN 5
+        ELSE 6
+    END;
 
 
 -- =============================================================================
--- Exercise 8a: Power Listeners Analysis
+-- Exercise 5f: Airport Trip Analysis
 -- =============================================================================
--- Approach:
---   1. Calculate total listening time per user.
---   2. Find the 95th percentile threshold (top 5% = power listeners).
---   3. Compare power listeners vs regular listeners on key metrics.
+-- Analyse trips to/from the three major airports:
+--   JFK Airport     = zone 132
+--   LaGuardia       = zone 138
+--   Newark Airport  = zone 1 (EWR)
 --
--- Uses CTEs to build the analysis step by step for readability.
+-- Airport trips are a significant revenue source and have distinct patterns
+-- (flat-rate fares to JFK, surcharges, peak travel times).
 -- =============================================================================
 
-WITH user_totals AS (
-    -- Total listening stats per user
+-- Trip volume and revenue by airport and direction
+WITH airport_trips AS (
     SELECT
-        f.user_key,
-        SUM(f.listened_seconds)         AS total_seconds,
-        COUNT(*)                        AS total_listens,
-        AVG(f.listened_seconds)         AS avg_session_seconds,
-        COUNT(DISTINCT ep.podcast_id)   AS unique_podcasts
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    GROUP BY f.user_key
-),
-threshold AS (
-    -- Find the 95th percentile of total listening time
-    SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY total_seconds) AS p95
-    FROM user_totals
-),
-classified AS (
-    -- Label each user as power listener or regular
-    SELECT
-        ut.*,
-        u.subscription_type,
-        u.platform,
-        CASE WHEN ut.total_seconds >= t.p95 THEN 'Power Listener'
-             ELSE 'Regular'
-        END AS listener_type
-    FROM user_totals ut
-    CROSS JOIN threshold t
-    JOIN dim_users u ON ut.user_key = u.user_key
+        CASE
+            WHEN pickup_location_id IN (132, 138, 1) THEN 'From Airport'
+            WHEN dropoff_location_id IN (132, 138, 1) THEN 'To Airport'
+        END AS direction,
+        CASE
+            WHEN pickup_location_id = 132 OR dropoff_location_id = 132 THEN 'JFK'
+            WHEN pickup_location_id = 138 OR dropoff_location_id = 138 THEN 'LaGuardia'
+            WHEN pickup_location_id = 1   OR dropoff_location_id = 1   THEN 'Newark (EWR)'
+        END AS airport,
+        fare_amount,
+        tip_amount,
+        total_amount,
+        trip_distance,
+        trip_duration_minutes,
+        pickup_datetime
+    FROM fact_yellow_trips
+    WHERE pickup_location_id IN (132, 138, 1)
+       OR dropoff_location_id IN (132, 138, 1)
 )
 SELECT
-    listener_type,
-    COUNT(*)                                    AS user_count,
-    ROUND(AVG(total_seconds) / 3600.0, 1)       AS avg_total_hours,
-    ROUND(AVG(avg_session_seconds), 0)           AS avg_session_seconds,
-    ROUND(AVG(unique_podcasts), 1)               AS avg_unique_podcasts,
-    ROUND(AVG(total_listens), 0)                 AS avg_total_listens
-FROM classified
-GROUP BY listener_type
-ORDER BY listener_type;
+    airport,
+    direction,
+    COUNT(*)                                    AS trip_count,
+    ROUND(AVG(fare_amount), 2)                  AS avg_fare,
+    ROUND(AVG(tip_amount), 2)                   AS avg_tip,
+    ROUND(AVG(total_amount), 2)                 AS avg_total,
+    ROUND(AVG(trip_distance), 1)                AS avg_distance_mi,
+    ROUND(AVG(trip_duration_minutes), 0)        AS avg_duration_min
+FROM airport_trips
+WHERE direction IS NOT NULL
+GROUP BY airport, direction
+ORDER BY airport, direction;
 
-
--- =============================================================================
--- Exercise 8b: Podcast Similarity (Shared Listeners)
--- =============================================================================
--- Approach:
---   1. For each user, find all podcasts they listened to.
---   2. Self-join to find pairs of podcasts with shared listeners.
---   3. Calculate Jaccard similarity: |A intersect B| / |A union B|
---
--- This is useful for recommendation systems: "listeners of X also enjoy Y."
--- =============================================================================
-
-WITH user_podcasts AS (
-    -- Distinct user-podcast combinations
-    SELECT DISTINCT
-        f.user_key,
-        ep.podcast_id,
-        p.name_en AS podcast_name
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-),
-podcast_listeners AS (
-    -- Count total unique listeners per podcast (for union calculation)
-    SELECT podcast_id, podcast_name, COUNT(DISTINCT user_key) AS listener_count
-    FROM user_podcasts
-    GROUP BY podcast_id, podcast_name
-),
-pairs AS (
-    -- Self-join to find shared listeners between podcast pairs
+-- Peak hours for airport trips
+WITH airport_trips AS (
     SELECT
-        a.podcast_id   AS podcast_a_id,
-        a.podcast_name AS podcast_a,
-        b.podcast_id   AS podcast_b_id,
-        b.podcast_name AS podcast_b,
-        COUNT(DISTINCT a.user_key) AS shared_listeners
-    FROM user_podcasts a
-    JOIN user_podcasts b ON a.user_key = b.user_key
-                       AND a.podcast_id < b.podcast_id   -- Avoid duplicates and self-pairs
-    GROUP BY a.podcast_id, a.podcast_name, b.podcast_id, b.podcast_name
+        CASE
+            WHEN pickup_location_id = 132 OR dropoff_location_id = 132 THEN 'JFK'
+            WHEN pickup_location_id = 138 OR dropoff_location_id = 138 THEN 'LaGuardia'
+            WHEN pickup_location_id = 1   OR dropoff_location_id = 1   THEN 'Newark (EWR)'
+        END AS airport,
+        EXTRACT(HOUR FROM pickup_datetime)::INTEGER AS hour_of_day
+    FROM fact_yellow_trips
+    WHERE pickup_location_id IN (132, 138, 1)
+       OR dropoff_location_id IN (132, 138, 1)
 )
 SELECT
-    p.podcast_a,
-    p.podcast_b,
-    p.shared_listeners,
-    la.listener_count AS listeners_a,
-    lb.listener_count AS listeners_b,
-    -- Jaccard similarity = intersection / union
-    -- |A union B| = |A| + |B| - |A intersect B|
-    ROUND(
-        p.shared_listeners::DOUBLE /
-        (la.listener_count + lb.listener_count - p.shared_listeners),
-        4
-    ) AS jaccard_similarity
-FROM pairs p
-JOIN podcast_listeners la ON p.podcast_a_id = la.podcast_id
-JOIN podcast_listeners lb ON p.podcast_b_id = lb.podcast_id
-ORDER BY shared_listeners DESC
+    airport,
+    hour_of_day,
+    COUNT(*) AS trip_count
+FROM airport_trips
+GROUP BY airport, hour_of_day
+ORDER BY airport, trip_count DESC;
+
+-- Most common origin zones for JFK-bound trips
+SELECT
+    z.borough,
+    z.zone,
+    COUNT(*)                          AS trip_count,
+    ROUND(AVG(f.fare_amount), 2)      AS avg_fare,
+    ROUND(AVG(f.trip_distance), 1)    AS avg_distance
+FROM fact_yellow_trips f
+JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+WHERE f.dropoff_location_id = 132   -- JFK
+GROUP BY z.borough, z.zone
+ORDER BY trip_count DESC
+LIMIT 15;
+
+
+-- =============================================================================
+-- Exercise 8a: Peak Hour Analysis by Borough (Weekday vs Weekend)
+-- =============================================================================
+
+WITH hourly_trips AS (
+    SELECT
+        z.borough,
+        d.is_weekend,
+        EXTRACT(HOUR FROM f.pickup_datetime)::INTEGER AS hour_of_day,
+        COUNT(*) AS trip_count
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    JOIN dim_date d ON f.pickup_date_key = d.date_key
+    GROUP BY z.borough, d.is_weekend, hour_of_day
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY borough, is_weekend
+            ORDER BY trip_count DESC
+        ) AS rn
+    FROM hourly_trips
+)
+SELECT
+    borough,
+    CASE WHEN is_weekend THEN 'Weekend' ELSE 'Weekday' END AS day_type,
+    hour_of_day AS peak_hour,
+    trip_count
+FROM ranked
+WHERE rn = 1
+ORDER BY borough, day_type;
+
+
+-- =============================================================================
+-- Exercise 8b: Cross-Borough Trip Analysis
+-- =============================================================================
+
+WITH cross_borough AS (
+    SELECT
+        pz.borough AS pickup_borough,
+        dz.borough AS dropoff_borough,
+        f.fare_amount,
+        f.trip_distance,
+        f.trip_duration_minutes
+    FROM fact_yellow_trips f
+    JOIN dim_zones pz ON f.pickup_location_id = pz.location_id AND pz.is_current = true
+    JOIN dim_zones dz ON f.dropoff_location_id = dz.location_id AND dz.is_current = true
+    WHERE pz.borough != dz.borough
+      AND pz.borough != 'Unknown'
+      AND dz.borough != 'Unknown'
+)
+SELECT
+    pickup_borough,
+    dropoff_borough,
+    COUNT(*)                                    AS trip_count,
+    ROUND(AVG(fare_amount), 2)                  AS avg_fare,
+    ROUND(AVG(trip_distance), 1)                AS avg_distance_mi,
+    ROUND(AVG(trip_duration_minutes), 0)        AS avg_duration_min
+FROM cross_borough
+GROUP BY pickup_borough, dropoff_borough
+ORDER BY trip_count DESC
 LIMIT 20;
 
 
 -- =============================================================================
--- Exercise 8c: Funnel Analysis
--- =============================================================================
--- Approach:
---   Build a listening funnel per podcast category:
---     Stage 1: Users who started an episode (event_type in start, play, resume)
---     Stage 2: Users who listened past 50% completion
---     Stage 3: Users who completed the episode (event_type = 'complete')
---   Calculate conversion rates between each stage.
---
--- Funnel analysis reveals where users drop off, helping content creators
--- understand engagement quality by category.
+-- Exercise 8c: Weather-Revenue Correlation
 -- =============================================================================
 
-WITH listen_data AS (
-    -- Base data: every listen with category and completion
+WITH daily_revenue AS (
     SELECT
-        f.user_key,
-        f.event_type,
-        f.completion_pct,
-        p.category
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-),
-funnel AS (
-    SELECT
-        category,
-        -- Stage 1: all users who had any listening event
-        COUNT(DISTINCT user_key) AS stage1_started,
-        -- Stage 2: users who listened past 50%
-        COUNT(DISTINCT user_key) FILTER (
-            WHERE completion_pct > 0.5
-        ) AS stage2_past_50pct,
-        -- Stage 3: users who completed the episode
-        COUNT(DISTINCT user_key) FILTER (
-            WHERE event_type = 'complete'
-        ) AS stage3_completed
-    FROM listen_data
-    GROUP BY category
+        CAST(pickup_datetime AS DATE) AS trip_date,
+        COUNT(*)                       AS trip_count,
+        SUM(total_amount)              AS daily_revenue,
+        AVG(fare_amount)               AS avg_fare
+    FROM fact_yellow_trips
+    GROUP BY CAST(pickup_datetime AS DATE)
 )
 SELECT
-    category,
-    stage1_started,
-    stage2_past_50pct,
-    stage3_completed,
-    -- Conversion from start to 50%
-    ROUND(stage2_past_50pct::DOUBLE / NULLIF(stage1_started, 0) * 100, 1)
-        AS pct_start_to_50,
-    -- Conversion from 50% to complete
-    ROUND(stage3_completed::DOUBLE / NULLIF(stage2_past_50pct, 0) * 100, 1)
-        AS pct_50_to_complete,
-    -- Overall conversion: start to complete
-    ROUND(stage3_completed::DOUBLE / NULLIF(stage1_started, 0) * 100, 1)
-        AS pct_start_to_complete
-FROM funnel
-ORDER BY stage1_started DESC;
-
-
--- =============================================================================
--- Exercise 8d: Revenue Attribution
--- =============================================================================
--- Approach:
---   Trace ad revenue back to podcasts using the attribution chain:
---     ad_event -> listening_event (via event_id) -> episode -> podcast
---   Calculate revenue per podcast, per listen, and per listening hour.
---
--- Uses CTEs to build the chain step by step for clarity.
--- =============================================================================
-
-WITH attributed_revenue AS (
-    -- Step 1: Link each ad event to its podcast
-    SELECT
-        a.ad_event_id,
-        a.revenue_sar,
-        p.podcast_id,
-        p.name_en AS podcast_name
-    FROM fact_ad_events a
-    JOIN fact_listens fl  ON a.event_id = fl.event_id
-    JOIN dim_episodes ep  ON fl.episode_key = ep.episode_key
-    JOIN dim_podcasts p   ON ep.podcast_id = p.podcast_id AND p.is_current = true
-),
-podcast_listening AS (
-    -- Step 2: Total listening stats per podcast (for per-listen and per-hour metrics)
-    SELECT
-        ep.podcast_id,
-        COUNT(*) AS total_listens,
-        SUM(f.listened_seconds) / 3600.0 AS total_hours
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    GROUP BY ep.podcast_id
-),
-podcast_revenue AS (
-    -- Step 3: Aggregate revenue per podcast
-    SELECT
-        podcast_id,
-        podcast_name,
-        ROUND(SUM(revenue_sar), 2)  AS total_revenue_sar,
-        COUNT(*)                     AS ad_events
-    FROM attributed_revenue
-    GROUP BY podcast_id, podcast_name
-)
-SELECT
-    pr.podcast_name,
-    pr.total_revenue_sar,
-    pr.ad_events,
-    pl.total_listens,
-    ROUND(pl.total_hours, 1)                                   AS total_listening_hours,
-    -- Revenue per listen: how much revenue each listen generates
-    ROUND(pr.total_revenue_sar / NULLIF(pl.total_listens, 0), 4)  AS revenue_per_listen,
-    -- Revenue per hour: monetisation efficiency
-    ROUND(pr.total_revenue_sar / NULLIF(pl.total_hours, 0), 2)    AS revenue_per_hour
-FROM podcast_revenue pr
-JOIN podcast_listening pl ON pr.podcast_id = pl.podcast_id
-ORDER BY total_revenue_sar DESC;
+    -- Correlation between temperature and revenue
+    ROUND(CORR(w.temp_avg, dr.daily_revenue), 4)       AS temp_revenue_corr,
+    -- Correlation between precipitation and trip count
+    ROUND(CORR(w.precipitation, dr.trip_count), 4)      AS precip_trips_corr,
+    -- Average revenue on clear vs rainy vs snowy days
+    ROUND(AVG(dr.daily_revenue) FILTER (
+        WHERE w.weather_category = 'Clear'
+    ), 0)                                                AS avg_revenue_clear,
+    ROUND(AVG(dr.daily_revenue) FILTER (
+        WHERE w.weather_category = 'Rain'
+    ), 0)                                                AS avg_revenue_rain,
+    ROUND(AVG(dr.daily_revenue) FILTER (
+        WHERE w.weather_category = 'Snow'
+    ), 0)                                                AS avg_revenue_snow
+FROM daily_revenue dr
+JOIN dim_weather w ON dr.trip_date = w.date;

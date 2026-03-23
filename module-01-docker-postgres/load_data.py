@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 """
-Load raw podcast platform data into Postgres.
+Load real NYC TLC taxi data into Postgres.
 
 This is the solution script for Module 01. It demonstrates:
   - Connecting to Postgres with psycopg2
-  - Loading JSON, CSV, and JSONL files
-  - Data cleaning (messy dates, inconsistent genders, missing values)
+  - Loading Parquet files (trip data) via pyarrow + COPY
+  - Loading CSV reference data (zones, vendors, rates, weather)
   - Bulk loading with COPY via StringIO (10-50x faster than row-by-row INSERT)
-  - Proper error handling, logging, and idempotency (UPSERT with ON CONFLICT)
+  - Proper error handling, logging, and retry logic
+
+The data loaded here is real, unmodified NYC TLC trip records — all the
+messiness (null passenger counts, negative fares, impossible timestamps)
+is authentic.
 
 Usage:
     python load_data.py
 
 Prerequisites:
-    pip install psycopg2-binary
+    pip install psycopg2-binary pyarrow
 """
 
 import csv
 import io
-import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import psycopg2
-from psycopg2.extras import execute_values
+import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,7 +40,7 @@ DB_CONFIG = {
     "port": int(os.getenv("POSTGRES_PORT", "5432")),
     "user": os.getenv("POSTGRES_USER", "lakehouse"),
     "password": os.getenv("POSTGRES_PASSWORD", "lakehouse123"),
-    "dbname": os.getenv("POSTGRES_DB", "podcast_platform"),
+    "dbname": os.getenv("POSTGRES_DB", "nyc_taxi"),
 }
 
 # Path to raw data -- works from module-01-docker-postgres/ directory
@@ -81,387 +83,182 @@ def get_connection():
 
 
 # ---------------------------------------------------------------------------
-# Data cleaning utilities
+# Parquet → Postgres loader (COPY-based, fast)
 # ---------------------------------------------------------------------------
 
 
-def parse_date(value: str) -> str | None:
+def escape_copy_value(val) -> str:
+    """Escape a value for Postgres COPY TEXT format."""
+    if val is None:
+        return "\\N"
+    s = str(val)
+    # Escape backslashes, tabs, and newlines
+    s = s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    return s
+
+
+def load_parquet_to_table(conn, parquet_path: Path, table_name: str, column_mapping: dict):
     """
-    Parse messy date strings into ISO format (YYYY-MM-DD).
+    Load a Parquet file into a Postgres table using COPY.
 
-    The raw users.csv has dates in at least 4 formats:
-      - 2024-09-10        (ISO)
-      - 23/09/2022        (DD/MM/YYYY)
-      - 2022-09-21T00:00:00  (ISO with time)
-      - 03-09-2019        (DD-MM-YYYY)
+    Args:
+        conn: psycopg2 connection
+        parquet_path: Path to the .parquet file
+        table_name: Target Postgres table
+        column_mapping: Dict mapping parquet column names -> postgres column names.
+                        Only columns in this mapping are loaded.
     """
-    if not value or not value.strip():
-        return None
+    logger.info("Loading %s → %s", parquet_path.name, table_name)
+    start = time.time()
 
-    value = value.strip()
+    # Read parquet using pyarrow (memory-efficient: reads column-by-column)
+    parquet_cols = list(column_mapping.keys())
+    table = pq.read_table(parquet_path, columns=parquet_cols)
+    n_rows = len(table)
+    logger.info("  Read %s rows from parquet", f"{n_rows:,}")
 
-    # Remove time component if present
-    if "T" in value:
-        value = value.split("T")[0]
+    # Convert to pandas for easier row iteration
+    df = table.to_pandas()
 
-    formats = [
-        "%Y-%m-%d",   # 2024-09-10
-        "%d/%m/%Y",   # 23/09/2022
-        "%d-%m-%Y",   # 03-09-2019
-        "%m-%d-%Y",   # fallback
-    ]
+    # Rename columns to match Postgres schema
+    df = df.rename(columns=column_mapping)
+    pg_cols = list(column_mapping.values())
 
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
+    # Build COPY buffer
+    buffer = io.StringIO()
+    for _, row in df.iterrows():
+        line = "\t".join(escape_copy_value(row[col]) for col in pg_cols)
+        buffer.write(line + "\n")
 
-    logger.warning("Could not parse date: '%s', returning None", value)
-    return None
+    buffer.seek(0)
+    cols_str = ", ".join(pg_cols)
 
+    with conn.cursor() as cur:
+        cur.copy_expert(
+            f"COPY {table_name} ({cols_str}) FROM STDIN WITH (FORMAT text, DELIMITER E'\\t')",
+            buffer,
+        )
 
-def normalize_gender(value: str) -> str | None:
-    """Normalize gender to 'm' or 'f'."""
-    if not value or not value.strip():
-        return None
-    v = value.strip().lower()
-    if v in ("m", "male"):
-        return "m"
-    if v in ("f", "female"):
-        return "f"
-    logger.warning("Unknown gender value: '%s'", value)
-    return None
-
-
-def normalize_subscription(value: str) -> str:
-    """Normalize subscription type to one of: free, premium, trial."""
-    if not value or not value.strip():
-        return "free"
-    v = value.strip().lower()
-    if v in ("premium", "premium_annual", "premium_monthly"):
-        return "premium"
-    if v in ("trial",):
-        return "trial"
-    return "free"
-
-
-def safe_int(value) -> int | None:
-    """Convert to int, return None for empty/invalid values."""
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return None
+    conn.commit()
+    elapsed = time.time() - start
+    rate = n_rows / elapsed if elapsed > 0 else 0
+    logger.info("  Loaded %s rows in %.1fs (%s rows/sec)", f"{n_rows:,}", elapsed, f"{rate:,.0f}")
 
 
 # ---------------------------------------------------------------------------
-# Loaders
+# CSV loaders (for reference/dimension tables)
 # ---------------------------------------------------------------------------
 
 
-def load_podcasts(conn):
-    """Load podcasts.json into the podcasts table."""
-    filepath = RAW_DATA_DIR / "podcasts.json"
-    logger.info("Loading podcasts from %s", filepath)
+def load_csv_to_table(conn, csv_path: Path, table_name: str, label: str):
+    """Load a CSV file into a Postgres table using COPY."""
+    if not csv_path.exists():
+        logger.warning("File not found, skipping: %s", csv_path)
+        return
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        podcasts = json.load(f)
+    logger.info("Loading %s from %s", label, csv_path.name)
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+
+    # Build COPY buffer
+    buffer = io.StringIO()
+    for row in rows:
+        line = "\t".join(escape_copy_value(v if v else None) for v in row)
+        buffer.write(line + "\n")
+
+    buffer.seek(0)
+    cols_str = ", ".join(header)
 
     with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO podcasts (podcast_id, name, name_en, category, language, host, created_at)
-            VALUES %s
-            ON CONFLICT (podcast_id) DO UPDATE SET
-                name = EXCLUDED.name,
-                name_en = EXCLUDED.name_en,
-                category = EXCLUDED.category,
-                language = EXCLUDED.language,
-                host = EXCLUDED.host,
-                created_at = EXCLUDED.created_at
-            """,
-            [
-                (
-                    p["podcast_id"],
-                    p["name"],
-                    p.get("name_en"),
-                    p["category"],
-                    p.get("language", "ar"),
-                    p["host"],
-                    p["created_at"],
-                )
-                for p in podcasts
-            ],
+        # Truncate + reload for dimension tables (they're small and idempotent)
+        cur.execute(f"TRUNCATE TABLE {table_name} CASCADE")
+        cur.copy_expert(
+            f"COPY {table_name} ({cols_str}) FROM STDIN WITH (FORMAT text, DELIMITER E'\\t')",
+            buffer,
         )
+
     conn.commit()
-    logger.info("Loaded %d podcasts", len(podcasts))
+    logger.info("  Loaded %d %s records", len(rows), label)
 
 
-def load_episodes(conn):
-    """Load episodes.json into the episodes table."""
-    filepath = RAW_DATA_DIR / "episodes.json"
-    logger.info("Loading episodes from %s", filepath)
+# ---------------------------------------------------------------------------
+# Column mappings: Parquet column names → Postgres column names
+# ---------------------------------------------------------------------------
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        episodes = json.load(f)
+YELLOW_COLUMNS = {
+    "VendorID": "vendor_id",
+    "tpep_pickup_datetime": "tpep_pickup_datetime",
+    "tpep_dropoff_datetime": "tpep_dropoff_datetime",
+    "passenger_count": "passenger_count",
+    "trip_distance": "trip_distance",
+    "RatecodeID": "rate_code_id",
+    "store_and_fwd_flag": "store_and_fwd_flag",
+    "PULocationID": "pu_location_id",
+    "DOLocationID": "do_location_id",
+    "payment_type": "payment_type",
+    "fare_amount": "fare_amount",
+    "extra": "extra",
+    "mta_tax": "mta_tax",
+    "tip_amount": "tip_amount",
+    "tolls_amount": "tolls_amount",
+    "improvement_surcharge": "improvement_surcharge",
+    "total_amount": "total_amount",
+    "congestion_surcharge": "congestion_surcharge",
+    "airport_fee": "airport_fee",
+}
 
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO episodes (episode_id, podcast_id, title, published_at, duration_seconds, season, episode_number)
-            VALUES %s
-            ON CONFLICT (episode_id) DO UPDATE SET
-                podcast_id = EXCLUDED.podcast_id,
-                title = EXCLUDED.title,
-                published_at = EXCLUDED.published_at,
-                duration_seconds = EXCLUDED.duration_seconds,
-                season = EXCLUDED.season,
-                episode_number = EXCLUDED.episode_number
-            """,
-            [
-                (
-                    e["episode_id"],
-                    e["podcast_id"],
-                    e["title"],
-                    e["published_at"],
-                    e["duration_seconds"],
-                    e.get("season"),
-                    e.get("episode_number"),
-                )
-                for e in episodes
-            ],
-        )
-    conn.commit()
-    logger.info("Loaded %d episodes", len(episodes))
+GREEN_COLUMNS = {
+    "VendorID": "vendor_id",
+    "lpep_pickup_datetime": "lpep_pickup_datetime",
+    "lpep_dropoff_datetime": "lpep_dropoff_datetime",
+    "passenger_count": "passenger_count",
+    "trip_distance": "trip_distance",
+    "RatecodeID": "rate_code_id",
+    "store_and_fwd_flag": "store_and_fwd_flag",
+    "PULocationID": "pu_location_id",
+    "DOLocationID": "do_location_id",
+    "payment_type": "payment_type",
+    "fare_amount": "fare_amount",
+    "extra": "extra",
+    "mta_tax": "mta_tax",
+    "tip_amount": "tip_amount",
+    "tolls_amount": "tolls_amount",
+    "improvement_surcharge": "improvement_surcharge",
+    "total_amount": "total_amount",
+    "congestion_surcharge": "congestion_surcharge",
+    "ehail_fee": "ehail_fee",
+    "trip_type": "trip_type",
+}
 
-
-def load_users(conn):
-    """
-    Load users.csv into the users table.
-
-    This is the messy one. The raw data has:
-      - Multiple date formats
-      - Inconsistent gender values (m, male, M, f, female, F)
-      - Missing ages and cities (empty strings)
-      - subscription_type values that need normalization (premium_annual -> premium)
-    """
-    filepath = RAW_DATA_DIR / "users.csv"
-    logger.info("Loading users from %s", filepath)
-
-    rows = []
-    skipped = 0
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            signup_date = parse_date(row.get("signup_date", ""))
-            gender = normalize_gender(row.get("gender", ""))
-            subscription = normalize_subscription(row.get("subscription_type", ""))
-            age = safe_int(row.get("age"))
-            city = row.get("city", "").strip() or None
-
-            rows.append((
-                row["user_id"],
-                row.get("name"),
-                row.get("email"),
-                row.get("country"),
-                city,
-                row.get("platform"),
-                signup_date,
-                subscription,
-                age,
-                gender,
-            ))
-
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO users (user_id, name, email, country, city, platform, signup_date, subscription_type, age, gender)
-            VALUES %s
-            ON CONFLICT (user_id) DO UPDATE SET
-                name = EXCLUDED.name,
-                email = EXCLUDED.email,
-                country = EXCLUDED.country,
-                city = EXCLUDED.city,
-                platform = EXCLUDED.platform,
-                signup_date = EXCLUDED.signup_date,
-                subscription_type = EXCLUDED.subscription_type,
-                age = EXCLUDED.age,
-                gender = EXCLUDED.gender
-            """,
-            rows,
-            page_size=1000,
-        )
-    conn.commit()
-    logger.info("Loaded %d users (%d skipped)", len(rows), skipped)
-
-
-def load_listening_events(conn):
-    """
-    Load listening events from JSONL files using COPY for performance.
-
-    COPY is the fastest way to bulk-load data into Postgres. We read JSONL,
-    transform to TSV in memory, then stream it into the table with copy_expert.
-    """
-    events_dir = RAW_DATA_DIR / "listening_events"
-    jsonl_files = sorted(events_dir.glob("*.jsonl"))
-    logger.info("Found %d JSONL files in %s", len(jsonl_files), events_dir)
-
-    total_loaded = 0
-    start_time = time.time()
-
-    # Process in batches of files to manage memory
-    BATCH_SIZE = 100
-
-    with conn.cursor() as cur:
-        for batch_start in range(0, len(jsonl_files), BATCH_SIZE):
-            batch_files = jsonl_files[batch_start:batch_start + BATCH_SIZE]
-            buffer = io.StringIO()
-
-            for filepath in batch_files:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        event = json.loads(line)
-
-                        # Write TSV line for COPY
-                        # Column order must match the COPY statement below
-                        row = "\t".join([
-                            event["event_id"],
-                            event["user_id"],
-                            event["episode_id"],
-                            event["event_type"],
-                            event["timestamp"],
-                            str(event.get("listened_seconds", 0)),
-                            event.get("platform", ""),
-                            event.get("country", ""),
-                            event.get("app_version", ""),
-                        ])
-                        buffer.write(row + "\n")
-
-            buffer.seek(0)
-            # Use a temp table + INSERT ... ON CONFLICT for idempotency
-            cur.execute("""
-                CREATE TEMP TABLE tmp_events (LIKE listening_events INCLUDING DEFAULTS)
-                ON COMMIT DROP
-            """)
-            cur.copy_expert(
-                """
-                COPY tmp_events (event_id, user_id, episode_id, event_type, event_timestamp,
-                                 listened_seconds, platform, country, app_version)
-                FROM STDIN WITH (FORMAT text, DELIMITER E'\\t')
-                """,
-                buffer,
-            )
-
-            cur.execute("""
-                INSERT INTO listening_events
-                SELECT * FROM tmp_events
-                ON CONFLICT (event_id) DO NOTHING
-            """)
-            batch_count = cur.rowcount
-            total_loaded += batch_count
-            conn.commit()
-
-            elapsed = time.time() - start_time
-            logger.info(
-                "Batch %d-%d: loaded %d events (total: %d, elapsed: %.1fs)",
-                batch_start,
-                batch_start + len(batch_files),
-                batch_count,
-                total_loaded,
-                elapsed,
-            )
-
-    elapsed = time.time() - start_time
-    logger.info("Loaded %d listening events in %.1f seconds", total_loaded, elapsed)
-
-
-def load_cdn_logs(conn):
-    """Load cdn_logs.csv using COPY for performance."""
-    filepath = RAW_DATA_DIR / "cdn_logs.csv"
-    logger.info("Loading CDN logs from %s", filepath)
-
-    rows = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append((
-                row["log_id"],
-                row.get("event_id") or None,
-                row.get("user_id") or None,
-                row["timestamp"],
-                row.get("isp"),
-                row.get("bitrate"),
-                safe_int(row.get("buffer_events", 0)),
-                float(row.get("rebuffer_ratio", 0)) if row.get("rebuffer_ratio") else 0,
-                safe_int(row.get("startup_time_ms")),
-                row.get("error_type") or None,
-                row.get("cdn_node"),
-                int(row.get("bytes_transferred", 0)) if row.get("bytes_transferred") else 0,
-            ))
-
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO cdn_logs (log_id, event_id, user_id, log_timestamp, isp, bitrate,
-                                  buffer_events, rebuffer_ratio, startup_time_ms, error_type,
-                                  cdn_node, bytes_transferred)
-            VALUES %s
-            ON CONFLICT (log_id) DO NOTHING
-            """,
-            rows,
-            page_size=5000,
-        )
-    conn.commit()
-    logger.info("Loaded %d CDN log records", len(rows))
-
-
-def load_ad_events(conn):
-    """Load ad_events.json into the ad_events table."""
-    filepath = RAW_DATA_DIR / "ad_events.json"
-    logger.info("Loading ad events from %s", filepath)
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        events = json.load(f)
-
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO ad_events (ad_event_id, event_id, user_id, ad_timestamp, ad_type,
-                                   action, advertiser, campaign_id, revenue_sar, duration_seconds)
-            VALUES %s
-            ON CONFLICT (ad_event_id) DO NOTHING
-            """,
-            [
-                (
-                    e["ad_event_id"],
-                    e.get("event_id"),
-                    e.get("user_id"),
-                    e["timestamp"],
-                    e["ad_type"],
-                    e["action"],
-                    e.get("advertiser"),
-                    e.get("campaign_id"),
-                    float(e.get("revenue_sar", 0)),
-                    safe_int(e.get("duration_seconds")),
-                )
-                for e in events
-            ],
-            page_size=5000,
-        )
-    conn.commit()
-    logger.info("Loaded %d ad events", len(events))
-
+FHV_COLUMNS = {
+    "hvfhs_license_num": "hvfhs_license_num",
+    "dispatching_base_num": "dispatching_base_num",
+    "originating_base_num": "originating_base_num",
+    "request_datetime": "request_datetime",
+    "on_scene_datetime": "on_scene_datetime",
+    "pickup_datetime": "pickup_datetime",
+    "dropoff_datetime": "dropoff_datetime",
+    "PULocationID": "pu_location_id",
+    "DOLocationID": "do_location_id",
+    "trip_miles": "trip_miles",
+    "trip_time": "trip_time",
+    "base_passenger_fare": "base_passenger_fare",
+    "tolls": "tolls",
+    "bcf": "bcf",
+    "sales_tax": "sales_tax",
+    "congestion_surcharge": "congestion_surcharge",
+    "airport_fee": "airport_fee",
+    "tips": "tips",
+    "driver_pay": "driver_pay",
+    "shared_request_flag": "shared_request_flag",
+    "shared_match_flag": "shared_match_flag",
+    "access_a_ride_flag": "access_a_ride_flag",
+    "wav_request_flag": "wav_request_flag",
+    "wav_match_flag": "wav_match_flag",
+}
 
 # ---------------------------------------------------------------------------
 # Verification
@@ -470,19 +267,22 @@ def load_ad_events(conn):
 
 def verify_loads(conn):
     """Print row counts for all tables to verify successful loading."""
-    tables = ["podcasts", "episodes", "users", "listening_events", "cdn_logs", "ad_events"]
+    tables = [
+        "taxi_zones", "vendors", "rate_codes", "payment_types", "fhv_bases",
+        "yellow_taxi_trips", "green_taxi_trips", "fhv_trips", "daily_weather",
+    ]
 
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     logger.info("VERIFICATION: Row counts")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
     with conn.cursor() as cur:
         for table in tables:
             cur.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608 -- table names are hardcoded
             count = cur.fetchone()[0]
-            logger.info("  %-20s %8d rows", table, count)
+            logger.info("  %-25s %12s rows", table, f"{count:,}")
 
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -491,26 +291,39 @@ def verify_loads(conn):
 
 
 def main():
-    """Load all raw data into Postgres in dependency order."""
+    """Load all raw NYC taxi data into Postgres."""
     logger.info("Starting data load from %s", RAW_DATA_DIR)
 
     if not RAW_DATA_DIR.exists():
         logger.error("Raw data directory not found: %s", RAW_DATA_DIR)
+        logger.error("Run 'python scripts/download_data.py' first to download the data.")
         sys.exit(1)
 
     conn = get_connection()
 
     try:
-        # Load in dependency order (podcasts before episodes, users before events)
-        load_podcasts(conn)
-        load_episodes(conn)
-        load_users(conn)
-        load_listening_events(conn)
-        load_cdn_logs(conn)
-        load_ad_events(conn)
+        # ----- Dimension tables first (small, fast) -----
+        load_csv_to_table(conn, RAW_DATA_DIR / "taxi_zone_lookup.csv", "taxi_zones", "taxi zones")
+        load_csv_to_table(conn, RAW_DATA_DIR / "vendors.csv", "vendors", "vendors")
+        load_csv_to_table(conn, RAW_DATA_DIR / "rate_codes.csv", "rate_codes", "rate codes")
+        load_csv_to_table(conn, RAW_DATA_DIR / "payment_types.csv", "payment_types", "payment types")
+        load_csv_to_table(conn, RAW_DATA_DIR / "fhv_bases.csv", "fhv_bases", "FHV bases")
+        load_csv_to_table(conn, RAW_DATA_DIR / "nyc_weather_2023.csv", "daily_weather", "daily weather")
+
+        # ----- Trip data (large, takes minutes) -----
+        # Yellow taxi
+        for parquet_file in sorted(RAW_DATA_DIR.glob("yellow_tripdata_*.parquet")):
+            load_parquet_to_table(conn, parquet_file, "yellow_taxi_trips", YELLOW_COLUMNS)
+
+        # Green taxi
+        for parquet_file in sorted(RAW_DATA_DIR.glob("green_tripdata_*.parquet")):
+            load_parquet_to_table(conn, parquet_file, "green_taxi_trips", GREEN_COLUMNS)
+
+        # For-hire vehicle (Uber/Lyft)
+        for parquet_file in sorted(RAW_DATA_DIR.glob("fhvhv_tripdata_*.parquet")):
+            load_parquet_to_table(conn, parquet_file, "fhv_trips", FHV_COLUMNS)
 
         verify_loads(conn)
-
         logger.info("All data loaded successfully.")
 
     except Exception:

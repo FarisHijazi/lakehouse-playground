@@ -1,26 +1,30 @@
 """
-Solution 03: Bronze to Silver (Clean, Deduplicate, Validate)
-=============================================================
-This DAG reads Bronze Parquet data, applies data quality rules, and writes
-clean data to the Silver layer.
+Solution 03: Bronze to Silver (Clean, Validate, Enrich Taxi Trips)
+===================================================================
+This DAG reads Bronze Parquet trip data, applies data quality rules and
+validation, adds derived columns, and writes clean data to the Silver layer.
 
 Key patterns demonstrated:
-  - Data cleaning: deduplication, null handling, value validation
+  - Data cleaning: null handling, outlier filtering, value validation
+  - Derived columns: trip_duration_minutes, speed_mph
   - Quality metrics: tracking how many rows were dropped and why
   - XCom for passing quality reports between tasks
-  - Separation of concerns: check -> clean -> write -> report
+  - Fan-out: yellow and green trips cleaned in parallel
 
 Cleaning rules applied:
-  1. Drop duplicate event_id values (keep first occurrence)
-  2. Drop rows where user_id or episode_id is null
-  3. Clamp negative listened_seconds to 0
-  4. Drop rows with unknown event_type values
-  5. Add processed_at timestamp for lineage tracking
+  1. Drop rows where pickup or dropoff datetime is null
+  2. Drop rows where passenger_count is null or <= 0
+  3. Filter trips with unreasonable distance (> 200 miles or < 0)
+  4. Filter trips with unreasonable fares (> $1000 or < 0)
+  5. Add trip_duration_minutes (dropoff_datetime - pickup_datetime)
+  6. Add speed_mph (trip_distance / duration_hours)
+  7. Filter trips with unreasonable speed (> 100 mph)
+  8. Add processed_at timestamp for lineage tracking
 
 Data flow:
-  /opt/airflow/data/processed/bronze/listening_events/date=YYYY-MM-DD/events.parquet
+  /opt/airflow/data/bronze/yellow_taxi_trips/year=YYYY/month=MM/trips.parquet
     -->
-  /opt/airflow/data/processed/silver/listening_events/date=YYYY-MM-DD/events.parquet
+  /opt/airflow/data/processed/silver/yellow_taxi_trips/year=YYYY/month=MM/trips.parquet
 
 Run as a standalone script to verify syntax:
     python solution_03_bronze_to_silver.py
@@ -37,10 +41,15 @@ from airflow.operators.python import PythonOperator
 # Constants
 # ---------------------------------------------------------------------------
 DATA_DIR = "/opt/airflow/data"
-BRONZE_EVENTS_DIR = f"{DATA_DIR}/processed/bronze/listening_events"
-SILVER_EVENTS_DIR = f"{DATA_DIR}/processed/silver/listening_events"
+BRONZE_DIR = f"{DATA_DIR}/bronze"
+SILVER_DIR = f"{DATA_DIR}/processed/silver"
 
-VALID_EVENT_TYPES = {"play", "pause", "resume", "complete", "skip"}
+# Cleaning thresholds
+MAX_DISTANCE_MILES = 200
+MAX_FARE_AMOUNT = 1000
+MAX_SPEED_MPH = 100
+MIN_DURATION_MINUTES = 0.5   # 30 seconds minimum
+MAX_DURATION_MINUTES = 720   # 12 hours maximum
 
 # ---------------------------------------------------------------------------
 # Default args
@@ -54,167 +63,317 @@ default_args = {
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _year_month(ds: str):
+    """Extract year, month, and year-month string from logical date."""
+    return ds[:4], ds[5:7], ds[:7]
+
+
+def _clean_trips(df, taxi_type: str):
+    """
+    Apply cleaning rules to a taxi trips DataFrame.
+
+    This function encapsulates the cleaning logic so it can be reused
+    for both yellow and green taxi trips. It returns the cleaned DataFrame
+    and a dictionary of quality metrics.
+
+    Args:
+        df: pandas DataFrame of raw trip data.
+        taxi_type: "yellow" or "green", used for logging.
+
+    Returns:
+        Tuple of (cleaned DataFrame, quality metrics dict).
+    """
+    import pandas as pd
+
+    total_rows_in = len(df)
+    metrics = {"total_rows_in": int(total_rows_in)}
+
+    # --- Determine datetime column names ---
+    # Yellow taxis use tpep_pickup_datetime / tpep_dropoff_datetime
+    # Green taxis use lpep_pickup_datetime / lpep_dropoff_datetime
+    if "tpep_pickup_datetime" in df.columns:
+        pickup_col = "tpep_pickup_datetime"
+        dropoff_col = "tpep_dropoff_datetime"
+    elif "lpep_pickup_datetime" in df.columns:
+        pickup_col = "lpep_pickup_datetime"
+        dropoff_col = "lpep_dropoff_datetime"
+    else:
+        # Fallback: try generic names
+        pickup_col = "pickup_datetime"
+        dropoff_col = "dropoff_datetime"
+
+    # Rename to standard column names for downstream consistency
+    df = df.rename(columns={
+        pickup_col: "pickup_datetime",
+        dropoff_col: "dropoff_datetime",
+    })
+
+    # Ensure datetime types
+    df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], errors="coerce")
+    df["dropoff_datetime"] = pd.to_datetime(df["dropoff_datetime"], errors="coerce")
+
+    # --- Step 1: Drop rows with null datetimes ---
+    rows_before = len(df)
+    df = df.dropna(subset=["pickup_datetime", "dropoff_datetime"])
+    null_datetimes = rows_before - len(df)
+    metrics["null_datetimes_dropped"] = int(null_datetimes)
+    print(f"  [{taxi_type}] Step 1 - Null datetimes dropped: {null_datetimes}")
+
+    # --- Step 2: Drop rows with invalid passenger count ---
+    if "passenger_count" in df.columns:
+        rows_before = len(df)
+        df = df.dropna(subset=["passenger_count"])
+        df = df[df["passenger_count"] > 0]
+        bad_passengers = rows_before - len(df)
+    else:
+        bad_passengers = 0
+    metrics["bad_passengers_dropped"] = int(bad_passengers)
+    print(f"  [{taxi_type}] Step 2 - Bad passenger_count dropped: {bad_passengers}")
+
+    # --- Step 3: Filter unreasonable distances ---
+    if "trip_distance" in df.columns:
+        rows_before = len(df)
+        df = df[
+            (df["trip_distance"] >= 0) &
+            (df["trip_distance"] <= MAX_DISTANCE_MILES)
+        ]
+        bad_distance = rows_before - len(df)
+    else:
+        bad_distance = 0
+    metrics["bad_distance_dropped"] = int(bad_distance)
+    print(f"  [{taxi_type}] Step 3 - Unreasonable distance dropped: {bad_distance}")
+
+    # --- Step 4: Filter unreasonable fares ---
+    if "fare_amount" in df.columns:
+        rows_before = len(df)
+        df = df[
+            (df["fare_amount"] >= 0) &
+            (df["fare_amount"] <= MAX_FARE_AMOUNT)
+        ]
+        bad_fares = rows_before - len(df)
+    else:
+        bad_fares = 0
+    metrics["bad_fares_dropped"] = int(bad_fares)
+    print(f"  [{taxi_type}] Step 4 - Unreasonable fares dropped: {bad_fares}")
+
+    # --- Step 5: Add trip_duration_minutes ---
+    # Duration is critical for calculating speed and identifying anomalies.
+    df["trip_duration_minutes"] = (
+        (df["dropoff_datetime"] - df["pickup_datetime"]).dt.total_seconds() / 60.0
+    )
+
+    # Filter out negative or extreme durations
+    rows_before = len(df)
+    df = df[
+        (df["trip_duration_minutes"] >= MIN_DURATION_MINUTES) &
+        (df["trip_duration_minutes"] <= MAX_DURATION_MINUTES)
+    ]
+    bad_duration = rows_before - len(df)
+    metrics["bad_duration_dropped"] = int(bad_duration)
+    print(f"  [{taxi_type}] Step 5 - Bad duration dropped: {bad_duration}")
+
+    # Round duration for readability
+    df["trip_duration_minutes"] = df["trip_duration_minutes"].round(2)
+
+    # --- Step 6: Add speed_mph ---
+    # Speed = distance / time. Guard against division by zero.
+    if "trip_distance" in df.columns:
+        duration_hours = df["trip_duration_minutes"] / 60.0
+        # Avoid division by zero by replacing 0 with NaN temporarily
+        duration_hours = duration_hours.replace(0, float("nan"))
+        df["speed_mph"] = (df["trip_distance"] / duration_hours).round(2)
+
+        # Filter unreasonable speeds
+        rows_before = len(df)
+        df = df[df["speed_mph"].isna() | (df["speed_mph"] <= MAX_SPEED_MPH)]
+        bad_speed = rows_before - len(df)
+        # Fill NaN speeds with 0 (zero-duration trips that slipped through)
+        df["speed_mph"] = df["speed_mph"].fillna(0)
+    else:
+        bad_speed = 0
+        df["speed_mph"] = 0
+    metrics["bad_speed_dropped"] = int(bad_speed)
+    print(f"  [{taxi_type}] Step 6 - Unreasonable speed dropped: {bad_speed}")
+
+    # --- Step 7: Add processed_at timestamp ---
+    df["processed_at"] = pd.Timestamp.now(tz="UTC")
+
+    # --- Step 8: Ensure taxi_type column exists ---
+    if "taxi_type" not in df.columns:
+        df["taxi_type"] = taxi_type
+
+    total_rows_out = len(df)
+    metrics["total_rows_out"] = int(total_rows_out)
+    total_dropped = total_rows_in - total_rows_out
+    drop_rate = (total_dropped / total_rows_in * 100) if total_rows_in > 0 else 0
+    print(f"  [{taxi_type}] Final: {total_rows_in:,} -> {total_rows_out:,} "
+          f"(dropped {total_dropped:,}, {drop_rate:.1f}%)")
+
+    return df, metrics
+
+
+# ---------------------------------------------------------------------------
 # Task callables
 # ---------------------------------------------------------------------------
 def check_bronze_data(ds: str, **context):
     """
-    Verify that the Bronze Parquet file exists for the given date.
+    Verify that at least one Bronze Parquet file exists for the given month.
     Skip downstream tasks if no Bronze data is available.
     """
-    bronze_path = f"{BRONZE_EVENTS_DIR}/date={ds}/events.parquet"
-    if not os.path.exists(bronze_path):
+    year, month, _ = _year_month(ds)
+
+    yellow_path = f"{BRONZE_DIR}/yellow_taxi_trips/year={year}/month={month}/trips.parquet"
+    green_path = f"{BRONZE_DIR}/green_taxi_trips/year={year}/month={month}/trips.parquet"
+
+    yellow_exists = os.path.exists(yellow_path)
+    green_exists = os.path.exists(green_path)
+
+    if not yellow_exists and not green_exists:
         raise AirflowSkipException(
-            f"Bronze data not found: {bronze_path}. "
-            f"Run the ingestion DAG for {ds} first."
+            f"No Bronze data found for {year}-{month}. "
+            f"Run the ingestion DAG first."
         )
-    print(f"Bronze data found: {bronze_path}")
+
+    if yellow_exists:
+        print(f"Bronze yellow data found: {yellow_path}")
+    else:
+        print(f"Bronze yellow data NOT found (will skip yellow cleaning)")
+
+    if green_exists:
+        print(f"Bronze green data found: {green_path}")
+    else:
+        print(f"Bronze green data NOT found (will skip green cleaning)")
 
 
-def clean_and_deduplicate(ds: str, ti, **context):
+def clean_yellow_trips(ds: str, ti, **context):
     """
-    Read Bronze data, apply cleaning rules, and write to Silver.
+    Read Bronze yellow taxi data, apply cleaning rules, write to Silver.
 
-    This function demonstrates a common pattern in data engineering:
-    track every transformation step so you can report on data quality.
-    We count rows removed at each stage and push these metrics to XComs.
-
-    Cleaning rules:
-      1. Deduplicate on event_id
-      2. Drop nulls in required fields (user_id, episode_id)
-      3. Clamp negative listened_seconds to 0
-      4. Filter to known event_type values
-      5. Add processed_at timestamp
+    Yellow taxis are the iconic NYC cabs that operate primarily in Manhattan
+    and at airports. Their data uses tpep_pickup/dropoff_datetime columns.
     """
     import pandas as pd
 
-    bronze_path = f"{BRONZE_EVENTS_DIR}/date={ds}/events.parquet"
-    print(f"Reading Bronze data: {bronze_path}")
+    year, month, _ = _year_month(ds)
+    bronze_path = f"{BRONZE_DIR}/yellow_taxi_trips/year={year}/month={month}/trips.parquet"
+
+    if not os.path.exists(bronze_path):
+        raise AirflowSkipException(f"No Bronze yellow data: {bronze_path}")
+
+    print(f"Reading Bronze yellow data: {bronze_path}")
     df = pd.read_parquet(bronze_path)
-    total_rows_in = len(df)
-    print(f"Bronze rows: {total_rows_in}")
+    print(f"Bronze yellow rows: {len(df):,}")
 
-    # --- Step 1: Deduplicate on event_id ---
-    # In real streaming systems, duplicate events are common due to at-least-once
-    # delivery guarantees. We keep the first occurrence.
-    rows_before = len(df)
-    df = df.drop_duplicates(subset=["event_id"], keep="first")
-    duplicates_removed = rows_before - len(df)
-    print(f"Step 1 - Duplicates removed: {duplicates_removed}")
+    # Apply cleaning
+    df_clean, metrics = _clean_trips(df, "yellow")
 
-    # --- Step 2: Drop rows with null required fields ---
-    # user_id and episode_id are required for any meaningful analysis.
-    rows_before = len(df)
-    df = df.dropna(subset=["user_id", "episode_id"])
-    nulls_dropped = rows_before - len(df)
-    print(f"Step 2 - Null user_id/episode_id dropped: {nulls_dropped}")
-
-    # --- Step 3: Clamp negative listened_seconds ---
-    # Negative values are data errors. We clamp to 0 rather than dropping
-    # the row, since the event itself is still valid.
-    if "listened_seconds" in df.columns:
-        negative_count = (df["listened_seconds"] < 0).sum()
-        df.loc[df["listened_seconds"] < 0, "listened_seconds"] = 0
-        print(f"Step 3 - Negative listened_seconds clamped: {negative_count}")
-    else:
-        negative_count = 0
-
-    # --- Step 4: Filter to valid event types ---
-    # Unknown event types indicate upstream schema changes or data corruption.
-    if "event_type" in df.columns:
-        rows_before = len(df)
-        invalid_types = df[~df["event_type"].isin(VALID_EVENT_TYPES)]["event_type"].unique()
-        df = df[df["event_type"].isin(VALID_EVENT_TYPES)]
-        invalid_type_count = rows_before - len(df)
-        if len(invalid_types) > 0:
-            print(f"Step 4 - Invalid event types found: {list(invalid_types)}")
-        print(f"Step 4 - Invalid event_type rows dropped: {invalid_type_count}")
-    else:
-        invalid_type_count = 0
-
-    # --- Step 5: Add processed_at timestamp ---
-    # This column records when the data was processed, useful for lineage
-    # and debugging. We use the current wall-clock time (not execution_date)
-    # because this represents processing time, not data time.
-    df["processed_at"] = pd.Timestamp.now(tz="UTC")
-
-    total_rows_out = len(df)
-    print(f"Silver rows: {total_rows_out} (dropped {total_rows_in - total_rows_out} total)")
-
-    # --- Write Silver output ---
-    output_dir = f"{SILVER_EVENTS_DIR}/date={ds}"
+    # Write Silver output
+    output_dir = f"{SILVER_DIR}/yellow_taxi_trips/year={year}/month={month}"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = f"{output_dir}/events.parquet"
-    df.to_parquet(output_path, engine="pyarrow", compression="snappy", index=False)
-    print(f"Wrote: {output_path}")
+    output_path = f"{output_dir}/trips.parquet"
+    df_clean.to_parquet(output_path, engine="pyarrow", compression="snappy", index=False)
+    print(f"Wrote Silver yellow: {output_path}")
 
-    # Push quality metrics to XComs for the reporting task
-    quality_metrics = {
-        "total_rows_in": int(total_rows_in),
-        "total_rows_out": int(total_rows_out),
-        "duplicates_removed": int(duplicates_removed),
-        "nulls_dropped": int(nulls_dropped),
-        "negative_values_clamped": int(negative_count),
-        "invalid_types_dropped": int(invalid_type_count),
-    }
-    ti.xcom_push(key="quality_metrics", value=quality_metrics)
-    ti.xcom_push(key="output_path", value=output_path)
+    ti.xcom_push(key="yellow_quality_metrics", value=metrics)
+    ti.xcom_push(key="yellow_output_path", value=output_path)
+
+
+def clean_green_trips(ds: str, ti, **context):
+    """
+    Read Bronze green taxi data, apply cleaning rules, write to Silver.
+
+    Green taxis (Boro taxis) were introduced in 2013 to serve areas outside
+    Manhattan's core. Their data uses lpep_pickup/dropoff_datetime columns.
+    """
+    import pandas as pd
+
+    year, month, _ = _year_month(ds)
+    bronze_path = f"{BRONZE_DIR}/green_taxi_trips/year={year}/month={month}/trips.parquet"
+
+    if not os.path.exists(bronze_path):
+        raise AirflowSkipException(f"No Bronze green data: {bronze_path}")
+
+    print(f"Reading Bronze green data: {bronze_path}")
+    df = pd.read_parquet(bronze_path)
+    print(f"Bronze green rows: {len(df):,}")
+
+    # Apply cleaning
+    df_clean, metrics = _clean_trips(df, "green")
+
+    # Write Silver output
+    output_dir = f"{SILVER_DIR}/green_taxi_trips/year={year}/month={month}"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = f"{output_dir}/trips.parquet"
+    df_clean.to_parquet(output_path, engine="pyarrow", compression="snappy", index=False)
+    print(f"Wrote Silver green: {output_path}")
+
+    ti.xcom_push(key="green_quality_metrics", value=metrics)
+    ti.xcom_push(key="green_output_path", value=output_path)
 
 
 def log_quality_metrics(ti, ds: str, **context):
     """
-    Pull and display quality metrics from the cleaning step.
+    Pull and display quality metrics from the cleaning steps.
 
     In production, you would send these metrics to a monitoring system
     and potentially trigger alerts if the drop rate exceeds a threshold
-    (e.g., "more than 10% of rows dropped -> alert the on-call engineer").
+    (e.g., "more than 20% of rows dropped -> alert the on-call engineer").
     """
-    metrics = ti.xcom_pull(
-        task_ids="clean_and_deduplicate", key="quality_metrics"
+    _, _, year_month = _year_month(ds)
+
+    yellow_metrics = ti.xcom_pull(
+        task_ids="clean_yellow_trips", key="yellow_quality_metrics"
     )
-    output_path = ti.xcom_pull(
-        task_ids="clean_and_deduplicate", key="output_path"
+    green_metrics = ti.xcom_pull(
+        task_ids="clean_green_trips", key="green_quality_metrics"
     )
 
-    if metrics is None:
-        print("No quality metrics available (task may have been skipped).")
-        return
-
-    total_in = metrics["total_rows_in"]
-    total_out = metrics["total_rows_out"]
-    drop_rate = ((total_in - total_out) / total_in * 100) if total_in > 0 else 0
-
     print("=" * 60)
-    print(f"  Data Quality Report for {ds}")
-    print("=" * 60)
-    print(f"  Rows in (Bronze)          : {total_in:,}")
-    print(f"  Rows out (Silver)         : {total_out:,}")
-    print(f"  Overall drop rate         : {drop_rate:.1f}%")
-    print(f"  ---")
-    print(f"  Duplicates removed        : {metrics['duplicates_removed']:,}")
-    print(f"  Null required fields      : {metrics['nulls_dropped']:,}")
-    print(f"  Negative values clamped   : {metrics['negative_values_clamped']:,}")
-    print(f"  Invalid event types       : {metrics['invalid_types_dropped']:,}")
-    print(f"  ---")
-    print(f"  Output file               : {output_path}")
+    print(f"  Data Quality Report for {year_month}")
     print("=" * 60)
 
-    # Example: alert if drop rate is too high
-    if drop_rate > 20:
-        print(
-            f"WARNING: Drop rate of {drop_rate:.1f}% exceeds 20% threshold. "
-            f"Investigate data quality for {ds}."
-        )
+    for label, metrics in [("Yellow", yellow_metrics), ("Green", green_metrics)]:
+        if metrics is None:
+            print(f"  {label} taxi: SKIPPED (no data)")
+            continue
+
+        total_in = metrics["total_rows_in"]
+        total_out = metrics["total_rows_out"]
+        drop_rate = ((total_in - total_out) / total_in * 100) if total_in > 0 else 0
+
+        print(f"  {label} taxi:")
+        print(f"    Rows in (Bronze)          : {total_in:,}")
+        print(f"    Rows out (Silver)         : {total_out:,}")
+        print(f"    Overall drop rate         : {drop_rate:.1f}%")
+        print(f"    ---")
+        print(f"    Null datetimes dropped    : {metrics['null_datetimes_dropped']:,}")
+        print(f"    Bad passenger count       : {metrics['bad_passengers_dropped']:,}")
+        print(f"    Unreasonable distance     : {metrics['bad_distance_dropped']:,}")
+        print(f"    Unreasonable fares        : {metrics['bad_fares_dropped']:,}")
+        print(f"    Bad duration              : {metrics['bad_duration_dropped']:,}")
+        print(f"    Unreasonable speed        : {metrics['bad_speed_dropped']:,}")
+        print()
+
+        if drop_rate > 20:
+            print(
+                f"    WARNING: Drop rate of {drop_rate:.1f}% exceeds 20% threshold. "
+                f"Investigate data quality for {year_month}."
+            )
+
+    print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
 # DAG definition
 # ---------------------------------------------------------------------------
 with DAG(
-    dag_id="bronze_to_silver_events",
-    description="Clean and deduplicate Bronze listening events into the Silver layer",
+    dag_id="bronze_to_silver_trips",
+    description="Clean and validate Bronze taxi trips into the Silver layer with derived columns",
     default_args=default_args,
-    start_date=datetime(2018, 1, 10),
-    schedule="@daily",
+    start_date=datetime(2023, 1, 1),
+    schedule="@monthly",
     catchup=False,
     tags=["module-03", "silver", "cleaning"],
 ) as dag:
@@ -224,18 +383,28 @@ with DAG(
         python_callable=check_bronze_data,
     )
 
-    clean = PythonOperator(
-        task_id="clean_and_deduplicate",
-        python_callable=clean_and_deduplicate,
+    yellow = PythonOperator(
+        task_id="clean_yellow_trips",
+        python_callable=clean_yellow_trips,
+    )
+
+    green = PythonOperator(
+        task_id="clean_green_trips",
+        python_callable=clean_green_trips,
     )
 
     report = PythonOperator(
         task_id="log_quality_metrics",
         python_callable=log_quality_metrics,
+        trigger_rule="none_failed",
     )
 
-    # Linear dependency chain
-    check >> clean >> report
+    # Fan-out pattern: check -> clean yellow & green in parallel -> report
+    #
+    #                +--> clean_yellow_trips --+
+    #   check ---+                             +--> log_quality_metrics
+    #                +--> clean_green_trips  --+
+    check >> [yellow, green] >> report
 
 
 # ---------------------------------------------------------------------------

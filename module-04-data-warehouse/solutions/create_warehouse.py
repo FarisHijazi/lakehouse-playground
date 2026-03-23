@@ -1,51 +1,55 @@
 """
 Module 04: Create Data Warehouse
 =================================
-This script builds a star schema data warehouse in DuckDB from raw podcast data.
+This script builds a star schema data warehouse in DuckDB from raw NYC TLC
+taxi data (Parquet and CSV files).
 
 It creates:
-  - dim_dates:    Calendar dimension (2018-01-01 to 2025-12-31)
-  - dim_users:    User dimension from users.csv
-  - dim_podcasts: Podcast dimension from podcasts.json
-  - dim_episodes: Episode dimension from episodes.json
-  - fact_listens: Listening events from listening_events/*.jsonl
-  - fact_ad_events: Ad impression/click events from ad_events.json
-  - fact_cdn_quality: CDN quality metrics from cdn_logs.csv
+  - dim_date:          Calendar dimension (2018-01-01 to 2025-12-31)
+  - dim_zones:         Taxi zone dimension from taxi_zones.csv
+  - dim_vendors:       Vendor dimension from vendors.csv
+  - dim_rate_codes:    Rate code dimension from rate_codes.csv
+  - dim_payment_types: Payment type dimension from payment_types.csv
+  - dim_fhv_bases:     FHV base dimension from fhv_bases.csv
+  - dim_weather:       Daily weather dimension from daily_weather.csv
+  - fact_yellow_trips: Yellow taxi trips from yellow_taxi_trips.parquet
+  - fact_green_trips:  Green taxi trips from green_taxi_trips.parquet
+  - fact_fhv_trips:    For-hire vehicle trips from fhv_trips.parquet
+
+This pattern -- reading raw Parquet/CSV into a star schema -- mirrors what
+Databricks does with Delta Lake tables in their Lakehouse architecture.
+DuckDB's native Parquet reader is excellent for this workflow.
 
 Usage:
     cd module-04-data-warehouse
     python solutions/create_warehouse.py
 """
 
-import os
+from pathlib import Path
+
 import duckdb
 
-
-def get_data_path(filename: str) -> str:
-    """Return the absolute path to a raw data file."""
-    base = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'raw')
-    return os.path.abspath(os.path.join(base, filename))
-
-
-def get_warehouse_path() -> str:
-    """Return the path where the warehouse.duckdb file will be created."""
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'warehouse.duckdb'))
+# ---------------------------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_RAW = PROJECT_ROOT / "data" / "raw"
+WAREHOUSE_PATH = Path(__file__).resolve().parent.parent / "warehouse.duckdb"
 
 
-def create_dim_dates(con: duckdb.DuckDBPyConnection) -> None:
+def create_dim_date(con: duckdb.DuckDBPyConnection) -> None:
     """
     Create the date dimension table.
 
-    This is a standard calendar dimension covering 2018-01-01 to 2025-12-31.
-    The date_key is an integer in YYYYMMDD format for efficient joins and
-    human-readable partition pruning.
+    Standard calendar dimension covering 2018-01-01 to 2025-12-31.
+    The date_key is an integer in YYYYMMDD format for efficient joins
+    and human-readable partition pruning.
     """
-    print("  Creating dim_dates...")
-    con.execute("DROP TABLE IF EXISTS dim_dates;")
+    print("  Creating dim_date...")
+    con.execute("DROP TABLE IF EXISTS dim_date;")
     con.execute("""
-        CREATE TABLE dim_dates AS
+        CREATE TABLE dim_date AS
         WITH date_spine AS (
-            -- Generate one row per day from 2018 through 2025
             SELECT UNNEST(generate_series(
                 DATE '2018-01-01',
                 DATE '2025-12-31',
@@ -53,8 +57,9 @@ def create_dim_dates(con: duckdb.DuckDBPyConnection) -> None:
             ))::DATE AS full_date
         )
         SELECT
-            -- Surrogate key in YYYYMMDD format for readability and fast integer joins
-            (YEAR(full_date) * 10000 + MONTH(full_date) * 100 + DAY(full_date))::INTEGER AS date_key,
+            (YEAR(full_date) * 10000
+             + MONTH(full_date) * 100
+             + DAY(full_date))::INTEGER     AS date_key,
             full_date,
             YEAR(full_date)::INTEGER        AS year,
             QUARTER(full_date)::INTEGER     AS quarter,
@@ -64,260 +69,289 @@ def create_dim_dates(con: duckdb.DuckDBPyConnection) -> None:
             ISODOW(full_date)::INTEGER      AS day_of_week,   -- 1=Monday, 7=Sunday
             DAYNAME(full_date)              AS day_name,
             WEEKOFYEAR(full_date)::INTEGER  AS week_of_year,
-            -- Weekend flag: Saturday=6, Sunday=7
             (ISODOW(full_date) >= 6)        AS is_weekend
         FROM date_spine
         ORDER BY full_date;
     """)
-    count = con.execute("SELECT COUNT(*) FROM dim_dates").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM dim_date").fetchone()[0]
     print(f"    -> {count} rows")
 
 
-def create_dim_users(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
+def create_dim_zones(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Create the users dimension table.
+    Create the taxi zones dimension table.
 
-    Handles several data quality issues in the raw CSV:
-      - Multiple date formats for signup_date (YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, ISO 8601)
-      - Inconsistent gender values (f, F, female, m, M, male)
-      - NULL city values
+    Loaded from taxi_zones.csv. Each row represents one of the 263 TLC
+    taxi zones across NYC boroughs. Includes SCD Type 2 columns for
+    tracking boundary changes over time.
     """
-    print("  Creating dim_users...")
-    users_file = os.path.join(data_path, 'users.csv')
-    con.execute("DROP TABLE IF EXISTS dim_users;")
+    print("  Creating dim_zones...")
+    zones_file = DATA_RAW / "taxi_zones.csv"
+    con.execute("DROP TABLE IF EXISTS dim_zones;")
     con.execute(f"""
-        CREATE TABLE dim_users AS
-        WITH raw AS (
-            SELECT * FROM read_csv('{users_file}',
-                header=true,
-                all_varchar=true,   -- Read everything as strings first for date parsing
-                nullstr=''
-            )
-        )
+        CREATE TABLE dim_zones AS
         SELECT
-            -- Surrogate key: sequential integer for warehouse joins
-            ROW_NUMBER() OVER (ORDER BY user_id)::INTEGER AS user_key,
-            user_id,
-            name,
-            email,
-            country,
-            city,
-            platform,
-            -- Parse the messy signup_date: try multiple formats
-            -- DuckDB's TRY_CAST handles ISO formats; strptime handles DD/MM/YYYY
-            COALESCE(
-                TRY_CAST(signup_date AS DATE),
-                TRY_STRPTIME(signup_date, '%d/%m/%Y')::DATE,
-                TRY_STRPTIME(signup_date, '%d-%m-%Y')::DATE
-            ) AS signup_date,
-            subscription_type,
-            TRY_CAST(age AS INTEGER) AS age,
-            -- Standardise gender to 'M' or 'F'
-            CASE
-                WHEN LOWER(gender) IN ('m', 'male')   THEN 'M'
-                WHEN LOWER(gender) IN ('f', 'female')  THEN 'F'
-                ELSE gender
-            END AS gender
-        FROM raw;
-    """)
-    count = con.execute("SELECT COUNT(*) FROM dim_users").fetchone()[0]
-    print(f"    -> {count} rows")
-
-
-def create_dim_podcasts(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
-    """
-    Create the podcasts dimension table.
-
-    Includes SCD Type 2 metadata columns (valid_from, valid_to, is_current)
-    so that the table is ready for tracking historical changes. On initial
-    load, all records are marked as current.
-    """
-    print("  Creating dim_podcasts...")
-    podcasts_file = os.path.join(data_path, 'podcasts.json')
-    con.execute("DROP TABLE IF EXISTS dim_podcasts;")
-    con.execute(f"""
-        CREATE TABLE dim_podcasts AS
-        SELECT
-            -- Surrogate key for warehouse joins
-            ROW_NUMBER() OVER (ORDER BY podcast_id)::INTEGER AS podcast_key,
-            podcast_id,
-            name,
-            name_en,
-            category,
-            language,
-            host,
+            ROW_NUMBER() OVER (ORDER BY LocationID)::INTEGER AS zone_key,
+            LocationID::INTEGER   AS location_id,
+            Borough               AS borough,
+            Zone                  AS zone,
+            service_zone          AS service_zone,
             -- SCD Type 2 columns: initially all records are current
-            CAST(created_at AS DATE)   AS valid_from,
-            DATE '9999-12-31'          AS valid_to,
-            TRUE                       AS is_current
-        FROM read_json('{podcasts_file}');
+            DATE '2009-01-01'     AS valid_from,
+            DATE '9999-12-31'     AS valid_to,
+            TRUE                  AS is_current
+        FROM read_csv('{zones_file}', header=true, auto_detect=true);
     """)
-    count = con.execute("SELECT COUNT(*) FROM dim_podcasts").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM dim_zones").fetchone()[0]
     print(f"    -> {count} rows")
 
 
-def create_dim_episodes(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
-    """
-    Create the episodes dimension table.
-
-    Derives duration_minutes from duration_seconds for analyst convenience.
-    Retains podcast_id as a degenerate dimension key so analysts can join
-    to dim_podcasts without going through a fact table.
-    """
-    print("  Creating dim_episodes...")
-    episodes_file = os.path.join(data_path, 'episodes.json')
-    con.execute("DROP TABLE IF EXISTS dim_episodes;")
+def create_dim_vendors(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the vendor dimension table from vendors.csv."""
+    print("  Creating dim_vendors...")
+    vendors_file = DATA_RAW / "vendors.csv"
+    con.execute("DROP TABLE IF EXISTS dim_vendors;")
     con.execute(f"""
-        CREATE TABLE dim_episodes AS
+        CREATE TABLE dim_vendors AS
         SELECT
-            ROW_NUMBER() OVER (ORDER BY episode_id)::INTEGER AS episode_key,
-            episode_id,
-            podcast_id,
-            title,
-            CAST(published_at AS TIMESTAMP) AS published_at,
-            duration_seconds::INTEGER       AS duration_seconds,
-            -- Derived column: minutes is more intuitive for analysts
-            ROUND(duration_seconds / 60.0, 1) AS duration_minutes,
-            season::INTEGER                 AS season,
-            episode_number::INTEGER         AS episode_number
-        FROM read_json('{episodes_file}');
+            vendor_id::INTEGER  AS vendor_id,
+            vendor_name         AS vendor_name
+        FROM read_csv('{vendors_file}', header=true, auto_detect=true);
     """)
-    count = con.execute("SELECT COUNT(*) FROM dim_episodes").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM dim_vendors").fetchone()[0]
     print(f"    -> {count} rows")
 
 
-def create_fact_listens(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
-    """
-    Create the listening events fact table.
-
-    Grain: one row per listening event.
-
-    Joins to dimension tables using surrogate keys for optimal performance.
-    Calculates completion_pct by dividing listened_seconds by episode duration.
-    """
-    print("  Creating fact_listens...")
-    events_glob = os.path.join(data_path, 'listening_events', '*.jsonl')
-    con.execute("DROP TABLE IF EXISTS fact_listens;")
+def create_dim_rate_codes(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the rate code dimension table from rate_codes.csv."""
+    print("  Creating dim_rate_codes...")
+    rc_file = DATA_RAW / "rate_codes.csv"
+    con.execute("DROP TABLE IF EXISTS dim_rate_codes;")
     con.execute(f"""
-        CREATE TABLE fact_listens AS
-        WITH raw_events AS (
-            -- DuckDB reads all JSONL files matching the glob pattern
-            SELECT * FROM read_json('{events_glob}',
-                format='newline_delimited',
-                columns={{
-                    event_id: 'VARCHAR',
-                    user_id: 'VARCHAR',
-                    episode_id: 'VARCHAR',
-                    event_type: 'VARCHAR',
-                    timestamp: 'TIMESTAMP',
-                    listened_seconds: 'INTEGER',
-                    platform: 'VARCHAR',
-                    country: 'VARCHAR',
-                    app_version: 'VARCHAR'
-                }}
-            )
-        )
+        CREATE TABLE dim_rate_codes AS
         SELECT
-            e.event_id,
-            -- Surrogate key lookups for dimension joins
-            u.user_key,
-            ep.episode_key,
-            d.date_key,
-            e.event_type,
-            e.listened_seconds,
-            -- Completion percentage: what fraction of the episode was listened to
+            rate_code_id::INTEGER  AS rate_code_id,
+            rate_code_name         AS rate_code_name
+        FROM read_csv('{rc_file}', header=true, auto_detect=true);
+    """)
+    count = con.execute("SELECT COUNT(*) FROM dim_rate_codes").fetchone()[0]
+    print(f"    -> {count} rows")
+
+
+def create_dim_payment_types(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the payment type dimension table from payment_types.csv."""
+    print("  Creating dim_payment_types...")
+    pt_file = DATA_RAW / "payment_types.csv"
+    con.execute("DROP TABLE IF EXISTS dim_payment_types;")
+    con.execute(f"""
+        CREATE TABLE dim_payment_types AS
+        SELECT
+            payment_type_id::INTEGER  AS payment_type_id,
+            payment_type_name         AS payment_type_name
+        FROM read_csv('{pt_file}', header=true, auto_detect=true);
+    """)
+    count = con.execute("SELECT COUNT(*) FROM dim_payment_types").fetchone()[0]
+    print(f"    -> {count} rows")
+
+
+def create_dim_fhv_bases(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Create the for-hire vehicle base dimension table from fhv_bases.csv.
+
+    FHV bases include Uber, Lyft, and traditional livery/black car companies.
+    The base_number is the TLC-assigned license number.
+    """
+    print("  Creating dim_fhv_bases...")
+    bases_file = DATA_RAW / "fhv_bases.csv"
+    con.execute("DROP TABLE IF EXISTS dim_fhv_bases;")
+    con.execute(f"""
+        CREATE TABLE dim_fhv_bases AS
+        SELECT
+            base_number,
+            base_name,
+            dba,
+            base_type
+        FROM read_csv('{bases_file}', header=true, auto_detect=true);
+    """)
+    count = con.execute("SELECT COUNT(*) FROM dim_fhv_bases").fetchone()[0]
+    print(f"    -> {count} rows")
+
+
+def create_dim_weather(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Create the daily weather dimension table from daily_weather.csv.
+
+    Includes a derived weather_category column for easy filtering:
+    'Snow', 'Rain', or 'Clear'.
+    """
+    print("  Creating dim_weather...")
+    weather_file = DATA_RAW / "daily_weather.csv"
+    con.execute("DROP TABLE IF EXISTS dim_weather;")
+    con.execute(f"""
+        CREATE TABLE dim_weather AS
+        SELECT
+            CAST(date AS DATE)              AS date,
+            temp_min::DOUBLE                AS temp_min,
+            temp_max::DOUBLE                AS temp_max,
+            temp_avg::DOUBLE                AS temp_avg,
+            precipitation::DOUBLE           AS precipitation,
+            snow_depth::DOUBLE              AS snow_depth,
+            wind_speed::DOUBLE              AS wind_speed,
+            -- Derived category for easy weather-impact analysis
             CASE
-                WHEN ep.duration_seconds > 0
-                THEN ROUND(LEAST(e.listened_seconds::DOUBLE / ep.duration_seconds, 1.0), 4)
-                ELSE 0.0
-            END AS completion_pct,
-            e.platform,
-            e.country,
-            CAST(e.timestamp AS TIMESTAMP) AS event_timestamp,
-            CAST(e.timestamp AS DATE)      AS event_date
-        FROM raw_events e
-        -- Left joins ensure we keep events even if dimension lookup fails
-        LEFT JOIN dim_users    u  ON e.user_id    = u.user_id
-        LEFT JOIN dim_episodes ep ON e.episode_id = ep.episode_id
-        LEFT JOIN dim_dates    d  ON CAST(e.timestamp AS DATE) = d.full_date
-        -- Physical ordering by date for scan efficiency (simulates sort key)
-        ORDER BY e.timestamp;
+                WHEN snow_depth > 0 THEN 'Snow'
+                WHEN precipitation > 0 THEN 'Rain'
+                ELSE 'Clear'
+            END AS weather_category
+        FROM read_csv('{weather_file}', header=true, auto_detect=true);
     """)
-    count = con.execute("SELECT COUNT(*) FROM fact_listens").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM dim_weather").fetchone()[0]
     print(f"    -> {count} rows")
 
 
-def create_fact_ad_events(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
+def create_fact_yellow_trips(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Create the ad events fact table.
+    Create the yellow taxi trips fact table from Parquet.
 
-    Grain: one row per ad impression or click event.
+    Grain: one row per yellow taxi trip.
 
-    Links to listening events via event_id, enabling revenue attribution
-    from ads back to specific episodes and podcasts.
+    DuckDB reads Parquet natively and efficiently -- this is the same pattern
+    Databricks uses to read Delta Lake tables (which are Parquet under the hood).
     """
-    print("  Creating fact_ad_events...")
-    ad_file = os.path.join(data_path, 'ad_events.json')
-    con.execute("DROP TABLE IF EXISTS fact_ad_events;")
+    print("  Creating fact_yellow_trips...")
+    parquet_file = DATA_RAW / "yellow_taxi_trips.parquet"
+    con.execute("DROP TABLE IF EXISTS fact_yellow_trips;")
     con.execute(f"""
-        CREATE TABLE fact_ad_events AS
+        CREATE TABLE fact_yellow_trips AS
         SELECT
-            a.ad_event_id,
-            u.user_key,
-            d.date_key,
-            a.event_id,              -- Links to fact_listens for attribution
-            a.ad_type,               -- pre_roll, mid_roll, post_roll
-            a.action,                -- impression, click, skip
-            a.advertiser,
-            a.campaign_id,
-            a.revenue_sar::DOUBLE    AS revenue_sar,
-            a.duration_seconds::INTEGER AS ad_duration_seconds,
-            CAST(a.timestamp AS TIMESTAMP) AS event_timestamp,
-            CAST(a.timestamp AS DATE)      AS event_date
-        FROM read_json('{ad_file}') a
-        LEFT JOIN dim_users u ON a.user_id = u.user_id
-        LEFT JOIN dim_dates d ON CAST(a.timestamp AS DATE) = d.full_date
-        ORDER BY a.timestamp;
+            ROW_NUMBER() OVER ()::INTEGER                   AS trip_id,
+            d.date_key                                      AS pickup_date_key,
+            CAST(tpep_pickup_datetime AS TIMESTAMP)         AS pickup_datetime,
+            CAST(tpep_dropoff_datetime AS TIMESTAMP)        AS dropoff_datetime,
+            VendorID::INTEGER                               AS vendor_id,
+            PULocationID::INTEGER                           AS pickup_location_id,
+            DOLocationID::INTEGER                           AS dropoff_location_id,
+            RatecodeID::INTEGER                             AS rate_code_id,
+            payment_type::INTEGER                           AS payment_type_id,
+            passenger_count::INTEGER                        AS passenger_count,
+            trip_distance::DOUBLE                           AS trip_distance,
+            -- Duration in minutes derived from timestamps
+            ROUND(EXTRACT(EPOCH FROM (
+                CAST(tpep_dropoff_datetime AS TIMESTAMP)
+                - CAST(tpep_pickup_datetime AS TIMESTAMP)
+            )) / 60.0, 2)                                   AS trip_duration_minutes,
+            fare_amount::DOUBLE                             AS fare_amount,
+            extra::DOUBLE                                   AS extra,
+            mta_tax::DOUBLE                                 AS mta_tax,
+            tip_amount::DOUBLE                              AS tip_amount,
+            tolls_amount::DOUBLE                            AS tolls_amount,
+            improvement_surcharge::DOUBLE                   AS improvement_surcharge,
+            total_amount::DOUBLE                            AS total_amount,
+            congestion_surcharge::DOUBLE                    AS congestion_surcharge,
+            airport_fee::DOUBLE                             AS airport_fee,
+            store_and_fwd_flag                              AS store_and_fwd_flag
+        FROM read_parquet('{parquet_file}') t
+        LEFT JOIN dim_date d
+            ON CAST(t.tpep_pickup_datetime AS DATE) = d.full_date
+        -- Filter out obviously invalid trips
+        WHERE tpep_pickup_datetime IS NOT NULL
+          AND tpep_dropoff_datetime IS NOT NULL
+          AND tpep_dropoff_datetime > tpep_pickup_datetime
+          AND trip_distance >= 0
+          AND fare_amount >= 0
+        ORDER BY tpep_pickup_datetime;
     """)
-    count = con.execute("SELECT COUNT(*) FROM fact_ad_events").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM fact_yellow_trips").fetchone()[0]
     print(f"    -> {count} rows")
 
 
-def create_fact_cdn_quality(con: duckdb.DuckDBPyConnection, data_path: str) -> None:
+def create_fact_green_trips(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Create the CDN quality fact table.
+    Create the green taxi trips fact table from Parquet.
 
-    Grain: one row per CDN log entry (one streaming request).
-
-    Tracks streaming quality metrics: buffering, startup time, errors.
-    Useful for monitoring platform reliability by ISP, CDN node, and time.
+    Grain: one row per green taxi trip.
+    Green taxis serve the outer boroughs (no pickups in core Manhattan).
     """
-    print("  Creating fact_cdn_quality...")
-    cdn_file = os.path.join(data_path, 'cdn_logs.csv')
-    con.execute("DROP TABLE IF EXISTS fact_cdn_quality;")
+    print("  Creating fact_green_trips...")
+    parquet_file = DATA_RAW / "green_taxi_trips.parquet"
+    con.execute("DROP TABLE IF EXISTS fact_green_trips;")
     con.execute(f"""
-        CREATE TABLE fact_cdn_quality AS
+        CREATE TABLE fact_green_trips AS
         SELECT
-            c.log_id,
-            u.user_key,
-            d.date_key,
-            c.event_id,              -- Links to fact_listens
-            c.isp,
-            c.bitrate,
-            c.buffer_events::INTEGER        AS buffer_events,
-            c.rebuffer_ratio::DOUBLE        AS rebuffer_ratio,
-            c.startup_time_ms::INTEGER      AS startup_time_ms,
-            c.error_type,
-            c.cdn_node,
-            c.bytes_transferred::BIGINT     AS bytes_transferred,
-            CAST(c.timestamp AS TIMESTAMP)  AS event_timestamp,
-            CAST(c.timestamp AS DATE)       AS event_date
-        FROM read_csv('{cdn_file}', header=true, nullstr='') c
-        LEFT JOIN dim_users u ON c.user_id = u.user_id
-        LEFT JOIN dim_dates d ON CAST(c.timestamp AS DATE) = d.full_date
-        ORDER BY c.timestamp;
+            ROW_NUMBER() OVER ()::INTEGER                   AS trip_id,
+            d.date_key                                      AS pickup_date_key,
+            CAST(lpep_pickup_datetime AS TIMESTAMP)         AS pickup_datetime,
+            CAST(lpep_dropoff_datetime AS TIMESTAMP)        AS dropoff_datetime,
+            VendorID::INTEGER                               AS vendor_id,
+            PULocationID::INTEGER                           AS pickup_location_id,
+            DOLocationID::INTEGER                           AS dropoff_location_id,
+            RatecodeID::INTEGER                             AS rate_code_id,
+            payment_type::INTEGER                           AS payment_type_id,
+            passenger_count::INTEGER                        AS passenger_count,
+            trip_distance::DOUBLE                           AS trip_distance,
+            ROUND(EXTRACT(EPOCH FROM (
+                CAST(lpep_dropoff_datetime AS TIMESTAMP)
+                - CAST(lpep_pickup_datetime AS TIMESTAMP)
+            )) / 60.0, 2)                                   AS trip_duration_minutes,
+            fare_amount::DOUBLE                             AS fare_amount,
+            extra::DOUBLE                                   AS extra,
+            mta_tax::DOUBLE                                 AS mta_tax,
+            tip_amount::DOUBLE                              AS tip_amount,
+            tolls_amount::DOUBLE                            AS tolls_amount,
+            improvement_surcharge::DOUBLE                   AS improvement_surcharge,
+            total_amount::DOUBLE                            AS total_amount,
+            congestion_surcharge::DOUBLE                    AS congestion_surcharge,
+            trip_type::INTEGER                              AS trip_type
+        FROM read_parquet('{parquet_file}') t
+        LEFT JOIN dim_date d
+            ON CAST(t.lpep_pickup_datetime AS DATE) = d.full_date
+        WHERE lpep_pickup_datetime IS NOT NULL
+          AND lpep_dropoff_datetime IS NOT NULL
+          AND lpep_dropoff_datetime > lpep_pickup_datetime
+          AND trip_distance >= 0
+          AND fare_amount >= 0
+        ORDER BY lpep_pickup_datetime;
     """)
-    count = con.execute("SELECT COUNT(*) FROM fact_cdn_quality").fetchone()[0]
+    count = con.execute("SELECT COUNT(*) FROM fact_green_trips").fetchone()[0]
+    print(f"    -> {count} rows")
+
+
+def create_fact_fhv_trips(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Create the for-hire vehicle trips fact table from Parquet.
+
+    Grain: one row per FHV trip.
+    FHV trips include Uber, Lyft, and traditional livery/black car services.
+    Note: FHV data does not include fare information (not reported to TLC).
+    """
+    print("  Creating fact_fhv_trips...")
+    parquet_file = DATA_RAW / "fhv_trips.parquet"
+    con.execute("DROP TABLE IF EXISTS fact_fhv_trips;")
+    con.execute(f"""
+        CREATE TABLE fact_fhv_trips AS
+        SELECT
+            ROW_NUMBER() OVER ()::INTEGER                   AS trip_id,
+            d.date_key                                      AS pickup_date_key,
+            CAST(pickup_datetime AS TIMESTAMP)              AS pickup_datetime,
+            CAST(dropoff_datetime AS TIMESTAMP)             AS dropoff_datetime,
+            dispatching_base_num                            AS dispatching_base_num,
+            PULocationID::INTEGER                           AS pickup_location_id,
+            DOLocationID::INTEGER                           AS dropoff_location_id,
+            COALESCE(SR_Flag, 0)::INTEGER                   AS shared_ride_flag,
+            -- Duration in minutes derived from timestamps
+            ROUND(EXTRACT(EPOCH FROM (
+                CAST(dropoff_datetime AS TIMESTAMP)
+                - CAST(pickup_datetime AS TIMESTAMP)
+            )) / 60.0, 2)                                   AS trip_duration_minutes
+        FROM read_parquet('{parquet_file}') t
+        LEFT JOIN dim_date d
+            ON CAST(t.pickup_datetime AS DATE) = d.full_date
+        WHERE pickup_datetime IS NOT NULL
+          AND dropoff_datetime IS NOT NULL
+          AND dropoff_datetime > pickup_datetime
+        ORDER BY pickup_datetime;
+    """)
+    count = con.execute("SELECT COUNT(*) FROM fact_fhv_trips").fetchone()[0]
     print(f"    -> {count} rows")
 
 
@@ -347,40 +381,39 @@ def print_summary(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def main():
-    warehouse_path = get_warehouse_path()
-    data_path = get_data_path('')
+    # Remove old warehouse file so we start fresh
+    if WAREHOUSE_PATH.exists():
+        WAREHOUSE_PATH.unlink()
 
-    # Remove old warehouse file if it exists so we start fresh
-    if os.path.exists(warehouse_path):
-        os.remove(warehouse_path)
-
-    print(f"Creating warehouse at: {warehouse_path}")
-    print(f"Reading raw data from: {data_path}")
+    print(f"Creating warehouse at: {WAREHOUSE_PATH}")
+    print(f"Reading raw data from: {DATA_RAW}")
     print()
 
-    # Connect to a persistent DuckDB file
-    con = duckdb.connect(warehouse_path)
+    con = duckdb.connect(str(WAREHOUSE_PATH))
 
     try:
         # Build dimension tables first (fact tables reference them)
         print("Building dimension tables...")
-        create_dim_dates(con)
-        create_dim_users(con, data_path)
-        create_dim_podcasts(con, data_path)
-        create_dim_episodes(con, data_path)
+        create_dim_date(con)
+        create_dim_zones(con)
+        create_dim_vendors(con)
+        create_dim_rate_codes(con)
+        create_dim_payment_types(con)
+        create_dim_fhv_bases(con)
+        create_dim_weather(con)
 
-        # Build fact tables (join to dimension surrogate keys)
+        # Build fact tables (join to dimension keys)
         print("\nBuilding fact tables...")
-        create_fact_listens(con, data_path)
-        create_fact_ad_events(con, data_path)
-        create_fact_cdn_quality(con, data_path)
+        create_fact_yellow_trips(con)
+        create_fact_green_trips(con)
+        create_fact_fhv_trips(con)
 
         # Show summary
         print_summary(con)
-        print(f"\nWarehouse file: {warehouse_path}")
-        print(f"File size: {os.path.getsize(warehouse_path) / (1024*1024):.1f} MB")
+        print(f"\nWarehouse file: {WAREHOUSE_PATH}")
+        print(f"File size: {WAREHOUSE_PATH.stat().st_size / (1024*1024):.1f} MB")
         print("\nDone! You can now query the warehouse with:")
-        print(f"  duckdb {warehouse_path}")
+        print(f"  duckdb {WAREHOUSE_PATH}")
 
     finally:
         con.close()

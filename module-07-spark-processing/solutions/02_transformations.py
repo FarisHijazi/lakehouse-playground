@@ -1,7 +1,14 @@
 """
-Exercise 3: Transformations - filter, select, withColumn, when/otherwise
-========================================================================
-Narrow transformations that process data without shuffling.
+Exercise 2: Transformations on NYC Taxi Trips
+===============================================
+Narrow transformations: filter, select, withColumn, when/otherwise.
+Add trip_duration, speed, trip classification, suspicious trip flags,
+and time extraction columns.
+
+Databricks equivalent:
+    - Same PySpark code works in Databricks notebooks
+    - Use display(df) instead of df.show()
+    - Databricks auto-visualizes results with charts
 """
 
 from pathlib import Path
@@ -9,121 +16,161 @@ from pathlib import Path
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
-    coalesce,
-    lower,
+    dayofweek,
+    hour,
+    lit,
+    month,
     round as spark_round,
     to_date,
-    trim,
     when,
 )
 
 
 def main():
+    # Databricks: spark is pre-configured; skip SparkSession.builder
     spark = (
         SparkSession.builder
         .master("local[*]")
-        .appName("PodcastAnalytics")
+        .appName("TaxiAnalytics")
         .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    data_dir = PROJECT_ROOT / "data" / "raw"
 
-    # Load data
-    events_df = spark.read.json(str(data_dir / "listening_events"))
-    users_df = spark.read.csv(str(data_dir / "users.csv"), header=True, inferSchema=True)
-
-    # ----------------------------------------------------------------
-    # 1. Filter: listening events from Saudi Arabia
-    # ----------------------------------------------------------------
-    sa_events = events_df.filter(col("country") == "SA")
-    print("=== Filter: Events from Saudi Arabia ===")
-    print(f"Total events      : {events_df.count():,}")
-    print(f"Saudi Arabia events: {sa_events.count():,}")
-    sa_events.show(5, truncate=False)
+    # Load yellow taxi trips
+    yellow_df = spark.read.parquet(str(data_dir / "yellow_tripdata_*.parquet"))
+    total_rows = yellow_df.count()
+    print(f"Total yellow trips loaded: {total_rows:,}")
 
     # ----------------------------------------------------------------
-    # 2. Select: keep only relevant columns
+    # 1. Filter: valid trips only (distance > 0 and fare > 0)
     # ----------------------------------------------------------------
-    selected = sa_events.select("user_id", "episode_id", "event_type", "listened_seconds")
-    print("=== Select: Relevant columns only ===")
+    valid_trips = yellow_df.filter(
+        (col("trip_distance") > 0) & (col("fare_amount") > 0)
+    )
+    filtered_out = total_rows - valid_trips.count()
+    print(f"\n=== Filter: Valid Trips ===")
+    print(f"Valid trips   : {valid_trips.count():,}")
+    print(f"Filtered out  : {filtered_out:,} ({filtered_out / max(total_rows, 1) * 100:.1f}%)")
+
+    # ----------------------------------------------------------------
+    # 2. Select: keep relevant columns
+    # ----------------------------------------------------------------
+    selected = valid_trips.select(
+        "VendorID",
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "trip_distance",
+        "fare_amount",
+        "tip_amount",
+        "total_amount",
+        "PULocationID",
+        "DOLocationID",
+        "payment_type",
+        "passenger_count",
+    )
+    print("\n=== Select: Relevant Columns ===")
     selected.printSchema()
-    selected.show(5)
+    selected.show(5, truncate=False)
 
     # ----------------------------------------------------------------
-    # 3. withColumn: add listened_minutes
+    # 3. withColumn: trip_duration_minutes
     # ----------------------------------------------------------------
-    with_minutes = selected.withColumn(
-        "listened_minutes",
-        spark_round(col("listened_seconds") / 60.0, 2),
-    )
-    print("=== withColumn: listened_minutes ===")
-    with_minutes.show(10)
-
-    # ----------------------------------------------------------------
-    # 4. when/otherwise: engagement tiers
-    # ----------------------------------------------------------------
-    tiered = with_minutes.withColumn(
-        "engagement_tier",
-        when(col("listened_minutes") < 1, "bounce")
-        .when(col("listened_minutes") < 10, "short")
-        .when(col("listened_minutes") < 30, "medium")
-        .otherwise("long"),
-    )
-    print("=== when/otherwise: Engagement tiers ===")
-    tiered.show(10)
-
-    print("Tier distribution:")
-    tiered.groupBy("engagement_tier").count().orderBy("count", ascending=False).show()
-
-    # ----------------------------------------------------------------
-    # 5. Standardize gender in users
-    # ----------------------------------------------------------------
-    print("=== Gender before cleaning ===")
-    users_df.groupBy("gender").count().orderBy("count", ascending=False).show()
-
-    gender_cleaned = users_df.withColumn(
-        "gender_clean",
-        when(lower(trim(col("gender"))).isin("m", "male"), "M")
-        .when(lower(trim(col("gender"))).isin("f", "female"), "F")
-        .otherwise("Unknown"),
-    )
-
-    print("=== Gender after cleaning ===")
-    gender_cleaned.groupBy("gender_clean").count().orderBy("count", ascending=False).show()
-    gender_cleaned.select("user_id", "name", "gender", "gender_clean").show(10, truncate=False)
-
-    # ----------------------------------------------------------------
-    # 6. Parse inconsistent signup_date formats
-    # ----------------------------------------------------------------
-    print("=== Date parsing ===")
-    print("Sample raw signup_date values:")
-    users_df.select("user_id", "signup_date").show(10, truncate=False)
-
-    date_cleaned = users_df.withColumn(
-        "signup_date_parsed",
-        coalesce(
-            to_date(col("signup_date"), "yyyy-MM-dd"),    # 2024-09-10
-            to_date(col("signup_date"), "dd-MM-yyyy"),    # 03-09-2019
-            to_date(col("signup_date"), "dd/MM/yyyy"),    # 23/09/2022
-            to_date(col("signup_date"), "MM-dd-yyyy"),    # 09-03-2019 (ambiguous)
+    with_duration = selected.withColumn(
+        "trip_duration_minutes",
+        spark_round(
+            (col("tpep_dropoff_datetime").cast("long") - col("tpep_pickup_datetime").cast("long")) / 60.0,
+            2,
         ),
     )
-
-    print("Parsed dates:")
-    date_cleaned.select("user_id", "signup_date", "signup_date_parsed").show(15, truncate=False)
-
-    null_dates = date_cleaned.filter(col("signup_date_parsed").isNull()).count()
-    print(f"Dates that could not be parsed: {null_dates}")
-    print()
+    print("=== withColumn: trip_duration_minutes ===")
+    with_duration.select(
+        "tpep_pickup_datetime", "tpep_dropoff_datetime", "trip_duration_minutes"
+    ).show(5, truncate=False)
 
     # ----------------------------------------------------------------
-    # 7. Explain plan -- verify no shuffle
+    # 4. withColumn: speed_mph
     # ----------------------------------------------------------------
-    print("=== Explain plan for narrow transformations ===")
+    with_speed = with_duration.withColumn(
+        "speed_mph",
+        when(
+            col("trip_duration_minutes") > 0,
+            spark_round(col("trip_distance") / (col("trip_duration_minutes") / 60.0), 2),
+        ).otherwise(lit(None)),
+    )
+    print("=== withColumn: speed_mph ===")
+    with_speed.select(
+        "trip_distance", "trip_duration_minutes", "speed_mph"
+    ).show(10, truncate=False)
+
+    # ----------------------------------------------------------------
+    # 5. when/otherwise: trip distance classification
+    # ----------------------------------------------------------------
+    classified = with_speed.withColumn(
+        "trip_category",
+        when(col("trip_distance") < 1, "short")
+        .when(col("trip_distance") < 5, "medium")
+        .when(col("trip_distance") < 20, "long")
+        .otherwise("extra_long"),
+    )
+    print("=== Trip Classification ===")
+    classified.groupBy("trip_category").count().orderBy("count", ascending=False).show()
+
+    # ----------------------------------------------------------------
+    # 6. Flag suspicious trips
+    # ----------------------------------------------------------------
+    flagged = classified.withColumn(
+        "is_suspicious",
+        when(col("speed_mph") > 100, lit(True))
+        .when((col("trip_distance") == 0) & (col("fare_amount") > 0), lit(True))
+        .when(col("trip_duration_minutes") < 0, lit(True))
+        .otherwise(lit(False)),
+    )
+    suspicious_count = flagged.filter(col("is_suspicious")).count()
+    print("=== Suspicious Trip Flags ===")
+    print(f"Suspicious trips: {suspicious_count:,} ({suspicious_count / max(flagged.count(), 1) * 100:.2f}%)")
+    flagged.filter(col("is_suspicious")).select(
+        "trip_distance", "fare_amount", "trip_duration_minutes", "speed_mph", "is_suspicious"
+    ).show(10, truncate=False)
+
+    # ----------------------------------------------------------------
+    # 7. Time extraction: hour, day_of_week, month
+    # ----------------------------------------------------------------
+    with_time = flagged.withColumn(
+        "pickup_hour", hour(col("tpep_pickup_datetime"))
+    ).withColumn(
+        "pickup_day_of_week", dayofweek(col("tpep_pickup_datetime"))
+    ).withColumn(
+        "pickup_month", month(col("tpep_pickup_datetime"))
+    ).withColumn(
+        "pickup_date", to_date(col("tpep_pickup_datetime"))
+    )
+
+    print("=== Time Extraction ===")
+    with_time.select(
+        "tpep_pickup_datetime", "pickup_hour", "pickup_day_of_week", "pickup_month", "pickup_date"
+    ).show(10, truncate=False)
+
+    # Quick distribution check
+    print("Trips by hour of day:")
+    with_time.groupBy("pickup_hour").count().orderBy("pickup_hour").show(24)
+
+    print("Trips by day of week (1=Sunday, 7=Saturday):")
+    with_time.groupBy("pickup_day_of_week").count().orderBy("pickup_day_of_week").show()
+
+    # ----------------------------------------------------------------
+    # 8. Explain plan -- verify no shuffle for narrow transformations
+    # ----------------------------------------------------------------
+    print("=== Explain Plan: Narrow Transformations ===")
     print("(No 'Exchange' node = no shuffle)")
-    tiered.explain()
+    with_time.filter(~col("is_suspicious")).select(
+        "trip_category", "speed_mph", "pickup_hour"
+    ).explain()
+
+    # Databricks: Use the Spark UI tab in the notebook for visual DAG
 
     spark.stop()
     print("\nDone.")

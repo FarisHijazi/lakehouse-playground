@@ -1,7 +1,8 @@
 # Module 03: Exercises
 
 Work through these exercises in order. Each one builds on the previous, taking you
-from your first Airflow interaction to a production-style multi-layer pipeline.
+from your first Airflow interaction to a production-style multi-layer pipeline
+processing NYC taxi trip data.
 
 ---
 
@@ -88,88 +89,95 @@ Create a file `dags/my_first_dag.py` that:
 
 ---
 
-## Exercise 3: Build a DAG to Ingest Raw Events to Bronze (Parquet)
+## Exercise 3: Build a DAG to Ingest Taxi Trips to Bronze (Parquet)
 
-**Goal**: Write a DAG that reads raw JSONL listening events for a specific date
-and writes them to Parquet format in the Bronze layer.
+**Goal**: Write a DAG that reads raw monthly taxi trip Parquet files and
+repartitions them by pickup date into the Bronze layer.
 
 **Requirements:**
 
-Create a file `dags/my_ingest_events.py` that:
+Create a file `dags/my_ingest_trips.py` that:
 
-1. Defines a DAG called `ingest_listening_events` with:
-   - `start_date` of January 10, 2018 (first available data date)
-   - `schedule` set to `@daily`
+1. Defines a DAG called `ingest_taxi_trips` with:
+   - `start_date` of January 1, 2023 (first available data month)
+   - `schedule` set to `@monthly`
    - `catchup=False`
    - Appropriate `default_args` with retries
 
 2. Contains these tasks:
-   - `check_source_file`: Verify the raw JSONL file exists for `{{ ds }}`
-   - `ingest_to_bronze`: Read the JSONL file, convert to Parquet, save to
-     `data/processed/bronze/listening_events/date={{ ds }}/events.parquet`
-   - `log_record_count`: Print how many records were ingested (use XComs)
+   - `check_source_files`: Verify raw Parquet files exist for yellow and green
+     taxi trips for the logical month
+   - `ingest_yellow_trips`: Read the yellow taxi Parquet file, write to
+     `data/bronze/yellow_taxi_trips/year=YYYY/month=MM/trips.parquet`
+   - `ingest_green_trips`: Read the green taxi Parquet file, write to
+     `data/bronze/green_taxi_trips/year=YYYY/month=MM/trips.parquet`
+   - `log_record_counts`: Print how many records were ingested (use XComs)
 
-3. Uses `{{ ds }}` (the logical date) to build file paths, making the DAG
+3. Uses `{{ ds }}` (the logical date) to derive year/month, making the DAG
    idempotent and backfill-friendly.
 
-4. The ingestion task should:
-   - Read from `/opt/airflow/data/raw/listening_events/events_{{ ds }}.jsonl`
-   - Write to `/opt/airflow/data/processed/bronze/listening_events/date={{ ds }}/events.parquet`
+4. The ingestion tasks should:
+   - Read from `/opt/airflow/data/raw/yellow_tripdata_YYYY-MM.parquet`
+   - Write to `/opt/airflow/data/bronze/yellow_taxi_trips/year=YYYY/month=MM/trips.parquet`
    - Use Snappy compression
    - Push the row count to XComs
 
 **Key concepts practiced:**
 - Using `execution_date` / `{{ ds }}` for idempotent processing
-- Partitioning output by date
+- Partitioning output by year and month
 - XCom for passing metadata between tasks
-- Error handling when source files are missing
+- Fan-out pattern (yellow and green trips processed in parallel)
 
 **Verification:**
-- Trigger the DAG manually (set the logical date to `2018-01-10`)
-- Check that a Parquet file was created at the expected path
-- Verify the row count in the task logs
+- Trigger the DAG manually (set the logical date to `2023-01-01`)
+- Check that Parquet files were created at the expected paths
+- Verify the row counts in the task logs
 
-**Hint**: Look at `dags/solution_02_ingest_events.py` for the reference solution.
+**Hint**: Look at `dags/solution_02_ingest_trips.py` for the reference solution.
 
 ---
 
-## Exercise 4: Build a DAG for Bronze to Silver (Clean and Deduplicate)
+## Exercise 4: Build a DAG for Bronze to Silver (Clean and Validate Trips)
 
-**Goal**: Write a DAG that reads Bronze Parquet data, applies cleaning and
-deduplication logic, and writes validated data to the Silver layer.
+**Goal**: Write a DAG that reads Bronze Parquet trip data, applies cleaning and
+validation logic, and writes validated data to the Silver layer.
 
 **Requirements:**
 
 Create a file `dags/my_bronze_to_silver.py` that:
 
-1. Defines a DAG called `bronze_to_silver_events` with:
-   - `start_date` of January 10, 2018
-   - `schedule` set to `@daily`
+1. Defines a DAG called `bronze_to_silver_trips` with:
+   - `start_date` of January 1, 2023
+   - `schedule` set to `@monthly`
    - `catchup=False`
 
 2. Contains these tasks:
-   - `check_bronze_data`: Verify Bronze Parquet exists for `{{ ds }}`
-   - `clean_and_deduplicate`: Read Bronze data and apply these transformations:
-     - Drop duplicate `event_id` values (keep first occurrence)
-     - Drop rows where `user_id` or `episode_id` is null
-     - Validate that `listened_seconds` is non-negative (set negatives to 0)
-     - Validate that `event_type` is one of: `play`, `pause`, `resume`,
-       `complete`, `skip` (drop unknown types)
+   - `check_bronze_data`: Verify Bronze Parquet exists for the logical month
+   - `clean_yellow_trips`: Read Bronze data and apply these transformations:
+     - Drop rows where pickup or dropoff datetime is null
+     - Drop rows where passenger_count is null or <= 0
+     - Filter out trips with unreasonable distances (> 200 miles or < 0)
+     - Filter out trips with unreasonable fares (> $1000 or < 0)
+     - Add `trip_duration_minutes` column (dropoff - pickup time difference)
+     - Add `speed_mph` column (distance / duration in hours)
+     - Filter out trips with unreasonable speeds (> 100 mph)
      - Add a `processed_at` timestamp column
-   - `write_silver`: Write cleaned data to
-     `data/processed/silver/listening_events/date={{ ds }}/events.parquet`
+   - `clean_green_trips`: Same cleaning rules for green taxi trips
    - `log_quality_metrics`: Print metrics via XComs:
      - Total rows in, rows out
-     - Number of duplicates removed
-     - Number of invalid rows dropped
+     - Number of null rows dropped
+     - Number of outlier rows dropped
 
-3. Dependencies: `check_bronze_data >> clean_and_deduplicate >> write_silver >> log_quality_metrics`
+3. Dependencies:
+   ```
+   check_bronze_data >> [clean_yellow_trips, clean_green_trips] >> log_quality_metrics
+   ```
 
 **Key concepts practiced:**
-- Data cleaning and validation patterns
+- Data cleaning and validation patterns for transportation data
 - Quality metrics and observability
-- Multi-step task chains
-- Separation of read/transform/write logic
+- Derived columns (duration, speed)
+- Fan-out pattern for parallel processing of taxi types
 
 **Hint**: Look at `dags/solution_03_bronze_to_silver.py` for the reference solution.
 
@@ -185,30 +193,33 @@ Gold-layer tables for analytics.
 Create a file `dags/my_silver_to_gold.py` that:
 
 1. Defines a DAG called `silver_to_gold_metrics` with:
-   - `start_date` of January 10, 2018
-   - `schedule` set to `@daily`
+   - `start_date` of January 1, 2023
+   - `schedule` set to `@monthly`
    - `catchup=False`
 
-2. Produces three Gold tables for each date:
-   - **Daily episode metrics**
-     (`data/processed/gold/daily_episode_metrics/date={{ ds }}/metrics.parquet`):
-     - `episode_id`, `total_listens`, `unique_listeners`, `total_seconds`,
-       `avg_listen_seconds`, `completion_rate` (fraction of `complete` events)
-   - **Daily platform metrics**
-     (`data/processed/gold/daily_platform_metrics/date={{ ds }}/metrics.parquet`):
-     - `platform`, `total_listens`, `unique_users`, `total_seconds`
-   - **Daily country metrics**
-     (`data/processed/gold/daily_country_metrics/date={{ ds }}/metrics.parquet`):
-     - `country`, `total_listens`, `unique_users`, `total_seconds`
+2. Produces three Gold tables for each month:
+   - **Daily trip metrics**
+     (`data/processed/gold/daily_trip_metrics/year=YYYY/month=MM/metrics.parquet`):
+     - `pickup_date`, `taxi_type`, `total_trips`, `total_passengers`,
+       `total_distance_miles`, `total_fare_amount`, `avg_trip_duration_minutes`,
+       `avg_speed_mph`
+   - **Zone popularity**
+     (`data/processed/gold/zone_popularity/year=YYYY/month=MM/metrics.parquet`):
+     - `pickup_zone_id`, `taxi_type`, `total_pickups`, `total_dropoffs`,
+       `avg_fare_amount`
+   - **Revenue summary**
+     (`data/processed/gold/revenue_summary/year=YYYY/month=MM/metrics.parquet`):
+     - `taxi_type`, `payment_type`, `total_trips`, `total_fare_amount`,
+       `total_tip_amount`, `total_total_amount`, `avg_tip_percentage`
 
 3. Each aggregation should be its own task so they can run in parallel:
    ```
-   check_silver >> [episode_metrics, platform_metrics, country_metrics] >> done
+   check_silver >> [daily_metrics, zone_popularity, revenue_summary] >> done
    ```
 
 **Key concepts practiced:**
 - Fan-out pattern (one check task, multiple parallel aggregations)
-- Writing meaningful aggregations
+- Writing meaningful aggregations for transportation analytics
 - Gold layer design for analytical consumption
 
 **Hint**: Look at `dags/solution_04_silver_to_gold.py` for the reference solution.
@@ -221,7 +232,7 @@ Create a file `dags/my_silver_to_gold.py` that:
 
 **Steps:**
 
-1. Make sure your ingestion DAG (Exercise 3) is working for a single date.
+1. Make sure your ingestion DAG (Exercise 3) is working for a single month.
 
 2. Enable `catchup=True` on the DAG (or use a dedicated copy).
 
@@ -229,9 +240,9 @@ Create a file `dags/my_silver_to_gold.py` that:
    ```bash
    docker compose exec airflow-scheduler \
      airflow dags backfill \
-       -s 2018-01-10 \
-       -e 2018-01-31 \
-       ingest_listening_events
+       -s 2023-01-01 \
+       -e 2023-06-01 \
+       ingest_taxi_trips
    ```
 
 4. Monitor the backfill in the Airflow UI:
@@ -243,7 +254,7 @@ Create a file `dags/my_silver_to_gold.py` that:
 
 **Questions to answer:**
 1. How many DAG runs were created for the date range?
-2. What happens for dates where no source file exists (e.g., `2018-01-11`)?
+2. What happens for months where no source file exists?
 3. If you backfill the same range again, do you get duplicate data?
 
 ---
@@ -276,8 +287,7 @@ Modify any of your existing DAGs to add:
        # In production, you would send a Slack/email/PagerDuty alert here
    ```
 
-4. **SLA monitoring**: Add `sla=timedelta(hours=1)` to critical tasks. (Note:
-   SLAs are checked by the scheduler and generate SLA miss entries in the UI.)
+4. **SLA monitoring**: Add `sla=timedelta(hours=1)` to critical tasks.
 
 5. **Graceful handling of missing data**: Instead of failing when a source file
    is missing, use `AirflowSkipException` to skip downstream tasks:
@@ -285,13 +295,14 @@ Modify any of your existing DAGs to add:
    from airflow.exceptions import AirflowSkipException
 
    def check_file(ds):
-       path = f"/opt/airflow/data/raw/listening_events/events_{ds}.jsonl"
+       year_month = ds[:7]  # "2023-01"
+       path = f"/opt/airflow/data/raw/yellow_tripdata_{year_month}.parquet"
        if not os.path.exists(path):
-           raise AirflowSkipException(f"No data for {ds}, skipping.")
+           raise AirflowSkipException(f"No data for {year_month}, skipping.")
    ```
 
 **Verification:**
-- Trigger the DAG for a date with no data file. The check task should show
+- Trigger the DAG for a month with no data file. The check task should show
   "skipped" (pink) status, and downstream tasks should also be skipped.
 - Simulate a failure (e.g., raise an exception in a task). Verify that the task
   retries and that the failure callback prints the alert message.
@@ -306,13 +317,13 @@ Modify any of your existing DAGs to add:
 
 Create a modified version of your ingestion DAG that:
 
-1. Starts with a `FileSensor` that waits for the daily JSONL file:
+1. Starts with a `FileSensor` that waits for the monthly Parquet file:
    ```python
    from airflow.sensors.filesystem import FileSensor
 
    wait_for_file = FileSensor(
-       task_id="wait_for_daily_file",
-       filepath="/opt/airflow/data/raw/listening_events/events_{{ ds }}.jsonl",
+       task_id="wait_for_yellow_file",
+       filepath="/opt/airflow/data/raw/yellow_tripdata_{{ ds[:7] }}.parquet",
        poke_interval=30,         # Check every 30 seconds
        timeout=600,              # Give up after 10 minutes
        mode="poke",              # Keep the worker slot while waiting
@@ -349,14 +360,15 @@ TaskGroups for organization.
 
 Create a file `dags/my_full_pipeline.py` that:
 
-1. Defines a DAG called `full_listening_pipeline` with:
-   - `start_date` of January 10, 2018
-   - `schedule` set to `@daily`
+1. Defines a DAG called `full_taxi_pipeline` with:
+   - `start_date` of January 1, 2023
+   - `schedule` set to `@monthly`
    - `catchup=False`
 
 2. Uses three `TaskGroup` blocks:
-   - `bronze_layer`: Contains the ingestion tasks (check file, ingest to Parquet)
-   - `silver_layer`: Contains cleaning/dedup tasks
+   - `bronze_layer`: Contains the ingestion tasks (check file, ingest yellow
+     and green trips to Parquet)
+   - `silver_layer`: Contains cleaning/validation tasks for both taxi types
    - `gold_layer`: Contains the three aggregation tasks running in parallel
 
 3. Dependencies between groups:
@@ -378,7 +390,7 @@ Create a file `dags/my_full_pipeline.py` that:
 
 **Verification:**
 - The DAG appears in the UI with three collapsible TaskGroups
-- Triggering it for a valid date processes data through all three layers
+- Triggering it for a valid month processes data through all three layers
 - The summary task prints a complete report
 
 **Hint**: Look at `dags/solution_05_full_pipeline.py` for the reference solution.
@@ -388,9 +400,9 @@ Create a file `dags/my_full_pipeline.py` that:
 ## Bonus Challenges
 
 ### Bonus 1: Dynamic DAGs
-Create a DAG factory function that generates one DAG per data source (listening
-events, CDN logs, ad events). Use a loop in your DAG file to register multiple
-DAGs with the Airflow scheduler.
+Create a DAG factory function that generates one DAG per taxi type (yellow,
+green, FHV). Use a loop in your DAG file to register multiple DAGs with the
+Airflow scheduler.
 
 ### Bonus 2: Dataset-Triggered DAGs (Airflow 2.4+)
 Instead of using sensors or time-based schedules to chain DAGs, use Airflow
@@ -398,9 +410,14 @@ Datasets. Have the Bronze DAG produce a Dataset event when it writes output,
 and have the Silver DAG trigger automatically when that Dataset is updated.
 
 ### Bonus 3: Custom Operator
-Write a custom `JsonlToParquetOperator` that encapsulates the JSONL-to-Parquet
-conversion logic. It should accept `source_path` and `dest_path` as parameters
-with Jinja templating support.
+Write a custom `ParquetCleanOperator` that encapsulates the trip cleaning logic.
+It should accept `source_path`, `dest_path`, and cleaning thresholds as
+parameters with Jinja templating support.
+
+### Bonus 4: Weather Enrichment
+Extend your Silver layer to join trip data with the `daily_weather.csv` file.
+Add weather columns (temperature, precipitation) to each trip based on the
+pickup date. Analyze how weather affects trip patterns in the Gold layer.
 
 ---
 
@@ -421,9 +438,11 @@ docker compose down -v
 To remove processed data created by the DAGs:
 
 ```bash
-rm -rf ../data/processed/bronze/listening_events
-rm -rf ../data/processed/silver/listening_events
-rm -rf ../data/processed/gold/daily_episode_metrics
-rm -rf ../data/processed/gold/daily_platform_metrics
-rm -rf ../data/processed/gold/daily_country_metrics
+rm -rf ../data/bronze/yellow_taxi_trips
+rm -rf ../data/bronze/green_taxi_trips
+rm -rf ../data/processed/silver/yellow_taxi_trips
+rm -rf ../data/processed/silver/green_taxi_trips
+rm -rf ../data/processed/gold/daily_trip_metrics
+rm -rf ../data/processed/gold/zone_popularity
+rm -rf ../data/processed/gold/revenue_summary
 ```

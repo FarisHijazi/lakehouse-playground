@@ -1,4 +1,4 @@
-podcast_analytics:
+nyc_taxi_analytics:
   target: dev
   outputs:
     dev:
