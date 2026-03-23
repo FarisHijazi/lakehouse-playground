@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Module 10 -- Exercise 8: Programmatic Metrics Layer
+Module 10 -- Exercise 4: Programmatic Metrics Layer
 =====================================================
 Reads metric definitions from metrics/metrics.yml, computes current values
-from the raw data, evaluates health status, and outputs both a console
-report and an HTML metrics card page.
+from the NYC taxi raw data, evaluates health status, and outputs both a
+console report and an HTML metrics card page.
 
 Outputs: ../output/metrics_report.html
 """
@@ -38,20 +38,16 @@ metric_defs = metrics_config["metrics"]
 con = duckdb.connect()
 
 con.execute(f"""
-    CREATE TABLE events AS
-    SELECT * FROM read_json_auto('{DATA_DIR}/listening_events/*.jsonl')
+    CREATE TABLE trips AS
+    SELECT * FROM read_parquet('{DATA_DIR}/yellow_tripdata_*.parquet')
 """)
 con.execute(f"""
-    CREATE TABLE users AS
-    SELECT * FROM read_csv_auto('{DATA_DIR}/users.csv')
+    CREATE TABLE zones AS
+    SELECT * FROM read_csv_auto('{DATA_DIR}/taxi_zone_lookup.csv')
 """)
 con.execute(f"""
-    CREATE TABLE ads AS
-    SELECT * FROM read_json_auto('{DATA_DIR}/ad_events.json')
-""")
-con.execute(f"""
-    CREATE TABLE cdn AS
-    SELECT * FROM read_csv_auto('{DATA_DIR}/cdn_logs.csv')
+    CREATE TABLE payment_types AS
+    SELECT * FROM read_csv_auto('{DATA_DIR}/payment_types.csv')
 """)
 
 # ---------------------------------------------------------------------------
@@ -59,130 +55,87 @@ con.execute(f"""
 # ---------------------------------------------------------------------------
 # We map each metric name to a SQL query that returns a single scalar.
 METRIC_QUERIES = {
-    "daily_active_users": """
-        SELECT ROUND(AVG(dau), 0) FROM (
-            SELECT CAST(timestamp AS DATE) AS d, COUNT(DISTINCT user_id) AS dau
-            FROM events GROUP BY 1
+    "daily_trips": """
+        SELECT ROUND(AVG(daily_count), 0) FROM (
+            SELECT CAST(tpep_pickup_datetime AS DATE) AS d, COUNT(*) AS daily_count
+            FROM trips GROUP BY 1
         )
     """,
-    "weekly_active_users": """
-        SELECT COUNT(DISTINCT user_id) FROM events
-        WHERE CAST(timestamp AS TIMESTAMP) >= (
-            SELECT MAX(CAST(timestamp AS TIMESTAMP)) - INTERVAL '7 days' FROM events
-        )
+    "trips_per_hour": """
+        SELECT ROUND(COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT
+            CAST(tpep_pickup_datetime AS DATE) || '-' ||
+            EXTRACT(HOUR FROM tpep_pickup_datetime)
+        ), 0), 1)
+        FROM trips
     """,
-    "monthly_active_users": """
-        SELECT COUNT(DISTINCT user_id) FROM events
-        WHERE CAST(timestamp AS TIMESTAMP) >= (
-            SELECT MAX(CAST(timestamp AS TIMESTAMP)) - INTERVAL '30 days' FROM events
-        )
+    "avg_passenger_count": """
+        SELECT ROUND(AVG(passenger_count), 2) FROM trips
+        WHERE passenger_count > 0
     """,
-    "dau_mau_ratio": """
-        WITH bounds AS (
-            SELECT MAX(CAST(timestamp AS TIMESTAMP)) AS max_ts FROM events
-        ),
-        dau AS (
-            SELECT COUNT(DISTINCT user_id) AS n FROM events, bounds
-            WHERE CAST(timestamp AS DATE) = CAST(bounds.max_ts AS DATE)
-        ),
-        mau AS (
-            SELECT COUNT(DISTINCT user_id) AS n FROM events, bounds
-            WHERE CAST(timestamp AS TIMESTAMP) >= bounds.max_ts - INTERVAL '30 days'
-        )
-        SELECT ROUND(dau.n * 1.0 / NULLIF(mau.n, 0), 4) FROM dau, mau
+    "total_revenue": """
+        SELECT ROUND(SUM(total_amount), 2) FROM trips
     """,
-    "avg_listen_duration_seconds": """
-        SELECT ROUND(AVG(listened_seconds), 1) FROM events
+    "avg_fare_amount": """
+        SELECT ROUND(AVG(fare_amount), 2) FROM trips
+        WHERE fare_amount > 0
     """,
-    "completion_rate": """
+    "avg_tip_percentage": """
+        SELECT ROUND(AVG(tip_amount / NULLIF(fare_amount, 0)), 4) FROM trips
+        WHERE fare_amount > 0 AND tip_amount >= 0
+    """,
+    "revenue_per_mile": """
+        SELECT ROUND(SUM(total_amount) / NULLIF(SUM(trip_distance), 0), 2)
+        FROM trips WHERE trip_distance > 0
+    """,
+    "avg_trip_distance": """
+        SELECT ROUND(AVG(trip_distance), 2) FROM trips
+        WHERE trip_distance > 0
+    """,
+    "avg_trip_duration_minutes": """
+        SELECT ROUND(AVG(
+            DATEDIFF('minute', tpep_pickup_datetime, tpep_dropoff_datetime)
+        ), 1)
+        FROM trips
+        WHERE tpep_dropoff_datetime > tpep_pickup_datetime
+    """,
+    "p95_trip_duration_minutes": """
+        SELECT ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY
+            DATEDIFF('minute', tpep_pickup_datetime, tpep_dropoff_datetime)
+        ), 1)
+        FROM trips
+        WHERE tpep_dropoff_datetime > tpep_pickup_datetime
+          AND DATEDIFF('minute', tpep_pickup_datetime, tpep_dropoff_datetime) > 0
+    """,
+    "short_trip_rate": """
         SELECT ROUND(
-            COUNT(*) FILTER (WHERE event_type = 'complete') * 1.0 /
-            NULLIF(COUNT(*) FILTER (WHERE event_type IN ('play','resume','complete')), 0),
-        4) FROM events
+            COUNT(*) FILTER (WHERE trip_distance < 1) * 1.0 / NULLIF(COUNT(*), 0),
+        4) FROM trips WHERE trip_distance >= 0
     """,
-    "listener_retention_d7": """
-        WITH first_listen AS (
-            SELECT user_id, MIN(CAST(timestamp AS DATE)) AS first_date
-            FROM events GROUP BY 1
-        ),
-        retained AS (
-            SELECT fl.user_id
-            FROM first_listen fl
-            JOIN events e ON fl.user_id = e.user_id
-            WHERE CAST(e.timestamp AS DATE) BETWEEN fl.first_date + 6 AND fl.first_date + 8
-        )
-        SELECT ROUND(COUNT(DISTINCT retained.user_id) * 1.0 /
-               NULLIF((SELECT COUNT(*) FROM first_listen), 0), 4)
-        FROM retained
+    "trips_by_borough": """
+        SELECT COUNT(*) FROM trips
     """,
-    "monthly_churn_rate": """
-        WITH months AS (
-            SELECT DISTINCT DATE_TRUNC('month', CAST(timestamp AS TIMESTAMP)) AS m
-            FROM events ORDER BY 1
-        ),
-        last_two AS (
-            SELECT m FROM months ORDER BY m DESC LIMIT 2
-        ),
-        prev AS (
-            SELECT DISTINCT user_id FROM events
-            WHERE DATE_TRUNC('month', CAST(timestamp AS TIMESTAMP)) = (
-                SELECT MIN(m) FROM last_two
-            )
-        ),
-        curr AS (
-            SELECT DISTINCT user_id FROM events
-            WHERE DATE_TRUNC('month', CAST(timestamp AS TIMESTAMP)) = (
-                SELECT MAX(m) FROM last_two
-            )
-        )
-        SELECT ROUND(1.0 - COUNT(DISTINCT curr.user_id) * 1.0 /
-               NULLIF((SELECT COUNT(*) FROM prev), 0), 4)
-        FROM prev LEFT JOIN curr ON prev.user_id = curr.user_id
-        WHERE curr.user_id IS NOT NULL
+    "top_pickup_zones": """
+        SELECT COUNT(DISTINCT PULocationID) FROM trips
     """,
-    "top_podcasts_by_plays": """
-        SELECT COUNT(*) FROM events
-    """,
-    "trending_episodes": """
-        SELECT COUNT(DISTINCT episode_id) FROM events
-    """,
-    "total_ad_revenue": """
-        SELECT ROUND(SUM(revenue_sar), 2) FROM ads
-    """,
-    "ad_fill_rate": """
+    "cross_borough_rate": """
         SELECT ROUND(
-            COUNT(*) FILTER (WHERE action = 'impression') * 1.0 /
+            COUNT(*) FILTER (WHERE pz.Borough != dz.Borough) * 1.0 /
             NULLIF(COUNT(*), 0),
-        4) FROM ads
+        4)
+        FROM trips t
+        JOIN zones pz ON t.PULocationID = pz.LocationID
+        JOIN zones dz ON t.DOLocationID = dz.LocationID
+        WHERE pz.Borough IS NOT NULL AND dz.Borough IS NOT NULL
+          AND pz.Borough != 'Unknown' AND dz.Borough != 'Unknown'
     """,
-    "effective_cpm": """
+    "credit_card_rate": """
         SELECT ROUND(
-            SUM(revenue_sar) /
-            NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0) * 1000,
-        2) FROM ads
+            COUNT(*) FILTER (WHERE payment_type = 1) * 1.0 / NULLIF(COUNT(*), 0),
+        4) FROM trips
     """,
-    "ad_click_through_rate": """
-        SELECT ROUND(
-            COUNT(*) FILTER (WHERE action = 'click') * 1.0 /
-            NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0),
-        4) FROM ads
-    """,
-    "rebuffer_rate": """
-        SELECT ROUND(AVG(rebuffer_ratio), 4) FROM cdn
-    """,
-    "median_startup_time_ms": """
-        SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY startup_time_ms), 0)
-        FROM cdn
-    """,
-    "streaming_error_rate": """
-        SELECT ROUND(
-            COUNT(*) FILTER (WHERE error_type IS NOT NULL AND error_type != '') * 1.0
-            / COUNT(*),
-        4) FROM cdn
-    """,
-    "listeners_by_country": """
-        SELECT COUNT(DISTINCT country) FROM events
-        WHERE country IS NOT NULL AND country != ''
+    "avg_tip_credit_card": """
+        SELECT ROUND(AVG(tip_amount), 2) FROM trips
+        WHERE payment_type = 1
     """,
 }
 
@@ -237,7 +190,7 @@ for mdef in metric_defs:
 print("=" * 80)
 print("  METRICS LAYER -- Current Values Report")
 print("=" * 80)
-print(f"  {'Metric':35s} {'Value':>15s} {'Status':>8s}  {'Domain':>14s}")
+print(f"  {'Metric':35s} {'Value':>15s} {'Status':>8s}  {'Domain':>18s}")
 print("  " + "-" * 76)
 
 STATUS_ICON = {"green": "[OK]", "yellow": "[WARN]", "red": "[CRIT]"}
@@ -248,7 +201,7 @@ for r in results:
     if r["value"] is not None and r["value"] == int(r["value"]):
         val_str = f"{int(r['value']):,}"
     icon = STATUS_ICON[r["status"]]
-    print(f"  {r['display_name']:35s} {val_str:>15s} {icon:>8s}  {r['domain']:>14s}")
+    print(f"  {r['display_name']:35s} {val_str:>15s} {icon:>8s}  {r['domain']:>18s}")
 
 print("=" * 80)
 
@@ -299,9 +252,9 @@ html_content = f"""<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>Podcast Platform -- Metrics Layer Report</h1>
+    <h1>NYC Taxi Analytics -- Metrics Layer Report</h1>
     <p style="text-align:center; color:#666;">
-        Computed from raw data. Status:
+        Computed from raw taxi trip data. Status:
         <span style="color:#28a745;">&#9679; OK</span> &nbsp;
         <span style="color:#ffc107;">&#9679; Warning</span> &nbsp;
         <span style="color:#dc3545;">&#9679; Critical</span>

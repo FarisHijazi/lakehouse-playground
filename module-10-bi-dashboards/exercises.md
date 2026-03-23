@@ -1,24 +1,24 @@
 # Module 10: Exercises -- BI & Dashboards
 
-## Exercise 1: Define KPIs and Metrics for the Podcast Platform
+## Exercise 1: Define KPIs and Metrics for the Taxi Analytics Platform
 
 **Objective**: Before building dashboards, clearly define what you are measuring and why.
 
 **Tasks**:
 
 1. For each business domain below, define at least three KPIs. For each KPI, specify:
-   - **Name** (e.g., `monthly_active_users`)
-   - **Business question it answers** (e.g., "How many users are engaging with our content?")
+   - **Name** (e.g., `avg_fare_amount`)
+   - **Business question it answers** (e.g., "What is the average fare passengers pay?")
    - **SQL expression** (using the raw data schema)
-   - **Dimensions** it can be sliced by (e.g., country, platform, subscription_type)
-   - **Target / benchmark** (e.g., DAU/MAU ratio > 0.2)
+   - **Dimensions** it can be sliced by (e.g., borough, payment_type, vendor)
+   - **Target / benchmark** (e.g., avg fare > $10)
 
    Business domains:
-   - **Growth**: DAU, WAU, MAU, signup trends
-   - **Engagement**: listen duration, completion rate, sessions per user
-   - **Monetization**: ad revenue, fill rate, ARPU
-   - **Quality**: rebuffer rate, startup time, error rate
-   - **Content**: top podcasts, category mix, trending episodes
+   - **Trip Volume**: daily trips, trips per hour, peak hour demand
+   - **Revenue**: total revenue, average fare, tip percentage, revenue per mile
+   - **Trip Characteristics**: average distance, average duration, speed
+   - **Geographic**: trips by borough, top pickup zones, popular routes
+   - **Payment**: payment type mix, credit card rate, tip by payment type
 
 2. Identify which KPIs are **leading indicators** (predict future outcomes) vs.
    **lagging indicators** (measure past results).
@@ -33,27 +33,27 @@
 ## Exercise 2: Build an Executive Summary Dashboard
 
 **Objective**: Build a single-page dashboard that gives leadership a quick overview
-of platform health.
+of taxi fleet performance.
 
 **Requirements**:
 
 1. **KPI cards** at the top showing:
-   - Total unique listeners (all time)
-   - Average listen duration (minutes)
-   - Episode completion rate
-   - Total ad revenue (SAR)
+   - Total trips
+   - Average fare amount ($)
+   - Average trip distance (miles)
+   - Total revenue ($)
 
-2. **Trend chart**: Daily active users over time (line chart).
+2. **Trend chart**: Daily trip count over time (line chart).
 
-3. **Breakdown chart**: Listens by platform (bar chart).
+3. **Breakdown chart**: Trips by borough (bar chart).
 
-4. **Category chart**: Listens by podcast category (pie/donut chart).
+4. **Payment chart**: Trips by payment type (pie/donut chart).
 
 5. Use the Plotly `make_subplots` layout or individual figures combined in a single
    HTML file.
 
-**Data sources**: `listening_events/*.jsonl`, `episodes.json`, `podcasts.json`,
-`ad_events.json`
+**Data sources**: `yellow_tripdata_*.parquet`, `taxi_zone_lookup.csv`,
+`payment_types.csv`
 
 **Starter hint**:
 ```python
@@ -63,9 +63,9 @@ from pathlib import Path
 DATA_DIR = Path(__file__).parent.parent.parent / "data" / "raw"
 con = duckdb.connect()
 
-# Load listening events
-events = con.execute(f"""
-    SELECT * FROM read_json_auto('{DATA_DIR}/listening_events/*.jsonl')
+# Load yellow taxi trips
+trips = con.execute(f"""
+    SELECT * FROM read_parquet('{DATA_DIR}/yellow_tripdata_*.parquet')
 """).df()
 ```
 
@@ -73,114 +73,28 @@ events = con.execute(f"""
 
 ---
 
-## Exercise 3: Build a Podcast Performance Deep-Dive
+## Exercise 3: Build a Geographic Analysis Dashboard
 
-**Objective**: Create a dashboard that lets content teams analyze individual podcast
-and episode performance.
-
-**Requirements**:
-
-1. **Top 10 podcasts** by total plays (horizontal bar chart).
-2. **Top 10 episodes** by unique listeners (horizontal bar chart).
-3. **Listens over time by podcast** (stacked area chart, top 5 podcasts).
-4. **Episode completion rate by podcast** (bar chart comparing completion rates).
-5. **Listen duration distribution** (histogram of listened_seconds).
-6. **Summary table** of all podcasts with columns: name, total_plays,
-   unique_listeners, avg_duration_min, completion_rate.
-
-**Data sources**: `listening_events/*.jsonl`, `episodes.json`, `podcasts.json`
-
-**Solution**: `solutions/podcast_performance.py`
-
----
-
-## Exercise 4: Build a User Engagement Analysis
-
-**Objective**: Understand how users engage with the platform over time using cohort
-analysis and retention metrics.
+**Objective**: Create a dashboard that visualizes taxi trip patterns across NYC
+boroughs and zones, identifying popular pickup/dropoff locations and routes.
 
 **Requirements**:
 
-1. **User signup cohort chart**: Number of users who signed up each month (bar chart).
-2. **Listening frequency distribution**: Histogram of events per user.
-3. **User activity heatmap**: Events by day-of-week and hour-of-day.
-4. **Platform usage over time**: Stacked area of events by platform (ios, android,
-   web, etc.).
-5. **Subscription type breakdown**: Pie chart of free vs. premium vs. trial users.
-6. **Power users table**: Top 20 users by total listened minutes.
+1. **Top 15 pickup zones** by trip count (horizontal bar chart).
+2. **Top 15 dropoff zones** by trip count (horizontal bar chart).
+3. **Borough-to-borough flow**: Heatmap of trip counts between pickup and dropoff boroughs.
+4. **Top 10 most popular routes** (zone pair with highest trip count, table).
+5. **Trips by borough over time**: Daily trip count per borough (stacked area chart).
+6. **Summary table** of all boroughs with columns: borough, total_trips,
+   avg_fare, avg_distance, avg_tip_pct.
 
-**Data sources**: `listening_events/*.jsonl`, `users.csv`
-
-**Solution**: `solutions/user_engagement.py`
-
----
-
-## Exercise 5: Build an Ad Revenue Dashboard
-
-**Objective**: Track advertising performance and revenue for the platform.
-
-**Requirements**:
-
-1. **KPI cards**: Total revenue, total impressions, average CPM, click-through rate.
-2. **Revenue over time**: Monthly revenue trend (bar chart).
-3. **Revenue by ad type**: pre_roll, mid_roll, post_roll breakdown (stacked bar).
-4. **Top advertisers**: Bar chart of revenue by advertiser.
-5. **Ad funnel**: impression -> click -> complete conversion funnel (funnel chart).
-6. **Campaign performance table**: Revenue, impressions, CTR, and completion rate
-   per campaign.
-
-**Data sources**: `ad_events.json`
-
-**Solution**: `solutions/ad_revenue.py`
-
----
-
-## Exercise 6: Build a Streaming Quality Monitoring Dashboard
-
-**Objective**: Monitor CDN and streaming quality to ensure a smooth listener
-experience.
-
-**Requirements**:
-
-1. **KPI cards**: Median startup time, average rebuffer ratio, error rate, total
-   sessions.
-2. **Startup time distribution**: Histogram of startup_time_ms.
-3. **Rebuffer ratio over time**: Line chart of daily average rebuffer_ratio.
-4. **Error breakdown**: Bar chart of error types and their frequency.
-5. **Quality by CDN node**: Table showing avg startup time and error rate per CDN
-   node.
-6. **Bitrate distribution**: Pie chart of sessions by bitrate.
-7. **Quality by ISP**: Comparison of rebuffer ratio across ISPs.
-
-**Data sources**: `cdn_logs.csv`
-
-**Solution**: `solutions/streaming_quality.py`
-
----
-
-## Exercise 7: Build a Geographic Heatmap of Listeners
-
-**Objective**: Visualize the geographic distribution of listeners and identify
-growth markets.
-
-**Requirements**:
-
-1. **World choropleth map**: Listeners by country (color intensity).
-2. **Top 10 countries** by listener count (horizontal bar chart).
-3. **Platform preference by country**: Stacked bar showing platform mix per top
-   country.
-4. **Subscription type by country**: What % of users in each country are premium?
-5. **Listening volume by country**: Total listened hours per country.
-6. **Summary table**: Country, listeners, total_hours, avg_session_min,
-   pct_premium.
-
-**Data sources**: `listening_events/*.jsonl`, `users.csv`
+**Data sources**: `yellow_tripdata_*.parquet`, `taxi_zone_lookup.csv`
 
 **Solution**: `solutions/geographic_analysis.py`
 
 ---
 
-## Exercise 8: Create a Metrics Definitions Document (the "Metrics Layer")
+## Exercise 4: Create a Metrics Definitions Document (the "Metrics Layer")
 
 **Objective**: Programmatically define, compute, and validate all platform metrics
 in one place.
@@ -221,3 +135,15 @@ pages with a navigation sidebar.
 Write a script that reads `metrics/metrics.yml`, computes current values, and
 sends a Slack-style alert (print to console) whenever a metric crosses its
 warning or critical threshold.
+
+### Bonus 4: Weather Impact Analysis
+
+Join taxi trip data with `nyc_weather_2023.csv` to analyze how weather conditions
+(rain, snow, temperature) affect trip volume, fares, and tip percentages. Build
+a dashboard comparing rainy vs. dry day metrics.
+
+### Bonus 5: Uber/Lyft Comparison
+
+Use the `fhvhv_tripdata` files to compare ride-hail (Uber/Lyft) trip patterns
+against yellow and green taxi trips. Analyze differences in trip distance,
+driver pay, and geographic coverage.

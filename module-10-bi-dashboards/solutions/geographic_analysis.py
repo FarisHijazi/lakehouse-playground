@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Module 10 -- Exercise 7: Geographic Distribution Analysis
-===========================================================
-Choropleth map, top countries, platform preference by country,
-subscription mix, listening volume, and summary table.
+Module 10 -- Exercise 3: Geographic Analysis Dashboard
+========================================================
+Analyzes NYC taxi trip patterns across boroughs and zones: top pickup/dropoff
+zones, borough-to-borough flow heatmap, popular routes, and summary statistics.
 
 Outputs: ../output/geographic_analysis.html
 """
@@ -27,90 +27,108 @@ con = duckdb.connect()
 # Load data
 # ---------------------------------------------------------------------------
 con.execute(f"""
-    CREATE TABLE events AS
-    SELECT * FROM read_json_auto('{DATA_DIR}/listening_events/*.jsonl')
+    CREATE TABLE trips AS
+    SELECT * FROM read_parquet('{DATA_DIR}/yellow_tripdata_*.parquet')
 """)
 con.execute(f"""
-    CREATE TABLE users AS
-    SELECT * FROM read_csv_auto('{DATA_DIR}/users.csv')
+    CREATE TABLE zones AS
+    SELECT * FROM read_csv_auto('{DATA_DIR}/taxi_zone_lookup.csv')
 """)
 
 # ---------------------------------------------------------------------------
-# ISO-2 to ISO-3 mapping for choropleth
+# Top 15 pickup zones
 # ---------------------------------------------------------------------------
-iso_map = {
-    "SA": "SAU", "AE": "ARE", "KW": "KWT", "BH": "BHR", "QA": "QAT",
-    "OM": "OMN", "EG": "EGY", "JO": "JOR", "LB": "LBN", "IQ": "IRQ",
-    "MA": "MAR", "TN": "TUN", "DZ": "DZA", "US": "USA", "GB": "GBR",
-    "FR": "FRA", "DE": "DEU", "CA": "CAN", "AU": "AUS", "IN": "IND",
-    "PK": "PAK", "TR": "TUR", "MY": "MYS", "ID": "IDN", "SY": "SYR",
-    "YE": "YEM", "LY": "LBY", "SD": "SDN", "PS": "PSE", "NL": "NLD",
-    "SE": "SWE", "IT": "ITA", "ES": "ESP", "BR": "BRA", "MX": "MEX",
-    "NG": "NGA", "ZA": "ZAF", "KE": "KEN", "JP": "JPN", "KR": "KOR",
-    "CN": "CHN", "SG": "SGP", "PH": "PHL", "TH": "THA", "RU": "RUS",
-}
+top_pickup = con.execute("""
+    SELECT z.Zone AS zone_name, z.Borough AS borough, COUNT(*) AS num_trips
+    FROM trips t
+    JOIN zones z ON t.PULocationID = z.LocationID
+    WHERE z.Zone IS NOT NULL AND z.Borough != 'Unknown'
+    GROUP BY 1, 2
+    ORDER BY 3 DESC
+    LIMIT 15
+""").df()
 
 # ---------------------------------------------------------------------------
-# Listeners by country
+# Top 15 dropoff zones
 # ---------------------------------------------------------------------------
-country_listeners = con.execute("""
-    SELECT country,
-           COUNT(DISTINCT user_id) AS listeners,
-           ROUND(SUM(listened_seconds) / 3600.0, 1) AS total_hours,
-           ROUND(AVG(listened_seconds) / 60.0, 1) AS avg_session_min,
-           COUNT(*) AS total_events
-    FROM events
-    WHERE country IS NOT NULL AND country != ''
+top_dropoff = con.execute("""
+    SELECT z.Zone AS zone_name, z.Borough AS borough, COUNT(*) AS num_trips
+    FROM trips t
+    JOIN zones z ON t.DOLocationID = z.LocationID
+    WHERE z.Zone IS NOT NULL AND z.Borough != 'Unknown'
+    GROUP BY 1, 2
+    ORDER BY 3 DESC
+    LIMIT 15
+""").df()
+
+# ---------------------------------------------------------------------------
+# Borough-to-borough flow (heatmap)
+# ---------------------------------------------------------------------------
+borough_flow = con.execute("""
+    SELECT
+        pz.Borough AS pickup_borough,
+        dz.Borough AS dropoff_borough,
+        COUNT(*) AS num_trips
+    FROM trips t
+    JOIN zones pz ON t.PULocationID = pz.LocationID
+    JOIN zones dz ON t.DOLocationID = dz.LocationID
+    WHERE pz.Borough IS NOT NULL AND dz.Borough IS NOT NULL
+      AND pz.Borough != 'Unknown' AND dz.Borough != 'Unknown'
+    GROUP BY 1, 2
+    ORDER BY 3 DESC
+""").df()
+
+# Pivot for heatmap
+boroughs = sorted(borough_flow["pickup_borough"].unique())
+heatmap_data = []
+for pu_b in boroughs:
+    row = []
+    for do_b in boroughs:
+        match = borough_flow[
+            (borough_flow["pickup_borough"] == pu_b) &
+            (borough_flow["dropoff_borough"] == do_b)
+        ]
+        row.append(int(match["num_trips"].sum()) if len(match) > 0 else 0)
+    heatmap_data.append(row)
+
+# ---------------------------------------------------------------------------
+# Top 10 routes (zone pairs)
+# ---------------------------------------------------------------------------
+top_routes = con.execute("""
+    SELECT
+        pz.Zone AS pickup_zone,
+        dz.Zone AS dropoff_zone,
+        pz.Borough AS pu_borough,
+        dz.Borough AS do_borough,
+        COUNT(*) AS num_trips,
+        ROUND(AVG(t.fare_amount), 2) AS avg_fare,
+        ROUND(AVG(t.trip_distance), 2) AS avg_distance
+    FROM trips t
+    JOIN zones pz ON t.PULocationID = pz.LocationID
+    JOIN zones dz ON t.DOLocationID = dz.LocationID
+    WHERE pz.Zone IS NOT NULL AND dz.Zone IS NOT NULL
+      AND pz.Borough != 'Unknown' AND dz.Borough != 'Unknown'
+    GROUP BY 1, 2, 3, 4
+    ORDER BY 5 DESC
+    LIMIT 10
+""").df()
+
+# ---------------------------------------------------------------------------
+# Borough summary statistics
+# ---------------------------------------------------------------------------
+borough_summary = con.execute("""
+    SELECT
+        pz.Borough AS borough,
+        COUNT(*) AS total_trips,
+        ROUND(AVG(t.fare_amount), 2) AS avg_fare,
+        ROUND(AVG(t.trip_distance), 2) AS avg_distance,
+        ROUND(AVG(t.tip_amount / NULLIF(t.fare_amount, 0)) * 100, 1) AS avg_tip_pct
+    FROM trips t
+    JOIN zones pz ON t.PULocationID = pz.LocationID
+    WHERE pz.Borough IS NOT NULL AND pz.Borough != 'Unknown'
+      AND t.fare_amount > 0
     GROUP BY 1
     ORDER BY 2 DESC
-""").df()
-
-country_listeners["iso3"] = country_listeners["country"].map(iso_map)
-
-# ---------------------------------------------------------------------------
-# Top 10 countries
-# ---------------------------------------------------------------------------
-top10 = country_listeners.head(10)
-
-# ---------------------------------------------------------------------------
-# Platform preference by top country
-# ---------------------------------------------------------------------------
-platform_by_country = con.execute("""
-    SELECT e.country, e.platform, COUNT(*) AS events
-    FROM events e
-    WHERE e.country IN (
-        SELECT country FROM (
-            SELECT country, COUNT(DISTINCT user_id) AS n
-            FROM events WHERE country IS NOT NULL AND country != ''
-            GROUP BY 1 ORDER BY 2 DESC LIMIT 8
-        )
-    )
-    GROUP BY 1, 2
-    ORDER BY 1, 3 DESC
-""").df()
-
-# ---------------------------------------------------------------------------
-# Subscription type by country (from users table)
-# ---------------------------------------------------------------------------
-sub_by_country = con.execute("""
-    SELECT country, subscription_type, COUNT(*) AS users
-    FROM users
-    WHERE country IS NOT NULL AND country != ''
-    GROUP BY 1, 2
-    ORDER BY 1
-""").df()
-
-# Compute premium percentage per country
-premium_pct = con.execute("""
-    SELECT country,
-           COUNT(*) AS total,
-           COUNT(*) FILTER (WHERE subscription_type = 'premium') AS premium,
-           ROUND(COUNT(*) FILTER (WHERE subscription_type = 'premium') * 100.0
-                 / COUNT(*), 1) AS pct_premium
-    FROM users
-    WHERE country IS NOT NULL AND country != ''
-    GROUP BY 1
-    ORDER BY 4 DESC
 """).df()
 
 # ---------------------------------------------------------------------------
@@ -119,104 +137,117 @@ premium_pct = con.execute("""
 fig = make_subplots(
     rows=3, cols=2,
     subplot_titles=(
-        "Listeners by Country (World Map)",
-        "Top 10 Countries by Listener Count",
-        "Platform Mix by Country (Top 8)",
-        "Premium Subscription % by Country",
-        "Total Listening Hours by Country (Top 10)",
+        "Top 15 Pickup Zones",
+        "Top 15 Dropoff Zones",
+        "Borough-to-Borough Trip Flow",
+        "Top 10 Routes (Zone Pairs)",
+        "Borough Summary Statistics",
         "",
     ),
     specs=[
-        [{"type": "choropleth"}, {"type": "xy"}],
         [{"type": "xy"}, {"type": "xy"}],
         [{"type": "xy"}, {"type": "table"}],
+        [{"type": "table"}, {"type": "xy"}],
     ],
-    row_heights=[0.40, 0.30, 0.30],
+    row_heights=[0.35, 0.35, 0.30],
     vertical_spacing=0.08,
     horizontal_spacing=0.10,
 )
 
-# 1 -- Choropleth
-fig.add_trace(go.Choropleth(
-    locations=country_listeners["iso3"],
-    z=country_listeners["listeners"],
-    text=country_listeners["country"],
-    colorscale="YlOrRd",
-    marker_line_color="white",
-    marker_line_width=0.5,
-    colorbar_title="Listeners",
-    showscale=True,
-), row=1, col=1)
-fig.update_geos(
-    showframe=False, showcoastlines=True,
-    projection_type="natural earth",
-)
-
-# 2 -- Top 10 countries bar
+# 1 -- Top pickup zones (horizontal bar)
 fig.add_trace(go.Bar(
-    y=top10["country"],
-    x=top10["listeners"],
+    y=top_pickup["zone_name"],
+    x=top_pickup["num_trips"],
     orientation="h",
     marker_color="#636EFA",
     showlegend=False,
+    text=top_pickup["borough"],
+    textposition="inside",
+), row=1, col=1)
+fig.update_yaxes(autorange="reversed", row=1, col=1)
+
+# 2 -- Top dropoff zones (horizontal bar)
+fig.add_trace(go.Bar(
+    y=top_dropoff["zone_name"],
+    x=top_dropoff["num_trips"],
+    orientation="h",
+    marker_color="#EF553B",
+    showlegend=False,
+    text=top_dropoff["borough"],
+    textposition="inside",
 ), row=1, col=2)
 fig.update_yaxes(autorange="reversed", row=1, col=2)
 
-# 3 -- Platform mix stacked bar
-platforms = platform_by_country["platform"].unique()
-palette = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
-           "#19D3F3", "#FF6692", "#B6E880"]
-for i, plat in enumerate(platforms):
-    sub = platform_by_country[platform_by_country["platform"] == plat]
-    fig.add_trace(go.Bar(
-        x=sub["country"], y=sub["events"],
-        name=plat,
-        marker_color=palette[i % len(palette)],
-    ), row=2, col=1)
-fig.update_layout(barmode="stack")
+# 3 -- Borough-to-borough heatmap
+fig.add_trace(go.Heatmap(
+    z=heatmap_data,
+    x=boroughs,
+    y=boroughs,
+    colorscale="YlOrRd",
+    showscale=True,
+    colorbar={"title": "Trips", "len": 0.3, "y": 0.5},
+    text=[[f"{v:,}" for v in row] for row in heatmap_data],
+    texttemplate="%{text}",
+    textfont={"size": 9},
+), row=2, col=1)
+fig.update_xaxes(title_text="Dropoff Borough", row=2, col=1)
+fig.update_yaxes(title_text="Pickup Borough", row=2, col=1)
 
-# 4 -- Premium % bar
-top_premium = premium_pct.head(15)
-fig.add_trace(go.Bar(
-    x=top_premium["country"],
-    y=top_premium["pct_premium"],
-    marker_color="#00CC96",
-    showlegend=False,
-), row=2, col=2)
-
-# 5 -- Listening hours bar
-fig.add_trace(go.Bar(
-    x=top10["country"],
-    y=top10["total_hours"],
-    marker_color="#FFA15A",
-    showlegend=False,
-), row=3, col=1)
-
-# 6 -- Summary table
-summary = country_listeners.head(15)
+# 4 -- Top routes table
+route_labels = [
+    f"{r['pickup_zone']} -> {r['dropoff_zone']}" for _, r in top_routes.iterrows()
+]
 fig.add_trace(go.Table(
     header=dict(
-        values=["Country", "Listeners", "Hours", "Avg Min", "Events"],
+        values=["Route", "Trips", "Avg Fare", "Avg Dist"],
+        fill_color="#EF553B",
+        font=dict(color="white", size=11),
+        align="left",
+    ),
+    cells=dict(
+        values=[
+            route_labels,
+            [f"{v:,}" for v in top_routes["num_trips"]],
+            [f"${v:.2f}" for v in top_routes["avg_fare"]],
+            [f"{v:.1f} mi" for v in top_routes["avg_distance"]],
+        ],
+        fill_color="lavender",
+        align="left",
+    ),
+), row=2, col=2)
+
+# 5 -- Borough summary table
+fig.add_trace(go.Table(
+    header=dict(
+        values=["Borough", "Total Trips", "Avg Fare", "Avg Distance", "Avg Tip %"],
         fill_color="#636EFA",
         font=dict(color="white", size=12),
         align="left",
     ),
     cells=dict(
         values=[
-            summary["country"],
-            summary["listeners"],
-            summary["total_hours"],
-            summary["avg_session_min"],
-            summary["total_events"],
+            borough_summary["borough"],
+            [f"{v:,}" for v in borough_summary["total_trips"]],
+            [f"${v:.2f}" for v in borough_summary["avg_fare"]],
+            [f"{v:.2f} mi" for v in borough_summary["avg_distance"]],
+            [f"{v:.1f}%" for v in borough_summary["avg_tip_pct"]],
         ],
         fill_color="lavender",
         align="left",
     ),
+), row=3, col=1)
+
+# 6 -- Trips by borough bar chart (simple overview)
+fig.add_trace(go.Bar(
+    x=borough_summary["borough"],
+    y=borough_summary["total_trips"],
+    marker_color="#00CC96",
+    showlegend=False,
 ), row=3, col=2)
 
 fig.update_layout(
-    title={"text": "Geographic Distribution of Listeners", "font": {"size": 24}, "x": 0.5},
-    height=1200,
+    title={"text": "NYC Taxi -- Geographic Analysis", "font": {"size": 24}, "x": 0.5},
+    height=1400,
     template="plotly_white",
     margin={"t": 80, "b": 40},
 )
@@ -227,22 +258,30 @@ fig.write_html(str(output_path), include_plotlyjs="cdn")
 # ---------------------------------------------------------------------------
 # Console summary
 # ---------------------------------------------------------------------------
-print("=" * 65)
+print("=" * 70)
 print("  GEOGRAPHIC ANALYSIS -- Summary Statistics")
-print("=" * 65)
-print(f"  Countries with listeners : {len(country_listeners)}")
-print(f"  Total listeners          : {country_listeners['listeners'].sum():,}")
+print("=" * 70)
 print()
-print("  Top 10 Countries:")
-print(f"  {'Country':>8s} {'Listeners':>10s} {'Hours':>10s} {'AvgMin':>8s}")
-print("  " + "-" * 40)
-for _, row in top10.iterrows():
-    print(f"  {row['country']:>8s} {row['listeners']:>10,} {row['total_hours']:>10.1f}"
-          f" {row['avg_session_min']:>8.1f}")
+print("  Borough Summary:")
+print(f"  {'Borough':>15s} {'Trips':>12s} {'AvgFare':>10s} {'AvgDist':>10s} {'TipPct':>8s}")
+print("  " + "-" * 58)
+for _, row in borough_summary.iterrows():
+    print(f"  {row['borough']:>15s} {row['total_trips']:>12,} ${row['avg_fare']:>8.2f}"
+          f" {row['avg_distance']:>9.2f} {row['avg_tip_pct']:>7.1f}%")
 print()
-print("  Premium Subscription % (top 10):")
-for _, row in premium_pct.head(10).iterrows():
-    print(f"    {row['country']:>8s} {row['pct_premium']:>6.1f}%"
-          f"  ({row['premium']:,}/{row['total']:,})")
-print("=" * 65)
+print("  Top 10 Routes:")
+print(f"  {'Route':>50s} {'Trips':>10s} {'AvgFare':>10s}")
+print("  " + "-" * 72)
+for _, row in top_routes.iterrows():
+    route = f"{row['pickup_zone']} -> {row['dropoff_zone']}"
+    print(f"  {route:>50s} {row['num_trips']:>10,} ${row['avg_fare']:>8.2f}")
+print()
+print("  Top 5 Pickup Zones:")
+for _, row in top_pickup.head(5).iterrows():
+    print(f"    {row['zone_name']:30s} ({row['borough']}) {row['num_trips']:>10,} trips")
+print()
+print("  Top 5 Dropoff Zones:")
+for _, row in top_dropoff.head(5).iterrows():
+    print(f"    {row['zone_name']:30s} ({row['borough']}) {row['num_trips']:>10,} trips")
+print("=" * 70)
 print(f"\n  Dashboard saved to: {output_path}")

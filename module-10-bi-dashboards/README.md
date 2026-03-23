@@ -4,9 +4,9 @@
 
 Business Intelligence (BI) transforms raw data into actionable insights through
 interactive dashboards, reports, and visualizations. In this module, we explore
-how a podcast platform like Thmanyah can leverage BI tools and practices to
-monitor performance, understand listener behavior, and drive data-informed
-decisions.
+how a taxi analytics platform can leverage BI tools and practices to monitor
+fleet performance, understand trip patterns, and drive data-informed decisions
+using NYC Taxi & Limousine Commission (TLC) data.
 
 ---
 
@@ -66,7 +66,7 @@ business metric.
 
 ### Why It Matters
 
-- **Consistency** -- "Monthly Active Users" means the same thing in every dashboard.
+- **Consistency** -- "Average Fare Amount" means the same thing in every dashboard.
 - **DRY** -- Define once, reuse across Superset, Looker, Python notebooks, and APIs.
 - **Governance** -- Owners, SLAs, and freshness guarantees per metric.
 
@@ -88,12 +88,12 @@ snowflake schema:
 
 ```
               ┌──────────────┐
-              │  dim_podcast  │
+              │  dim_vendor   │
               └──────┬───────┘
                      │
- ┌────────────┐  ┌───▼──────────────┐  ┌────────────┐
- │  dim_user   ├──┤ fact_listen_event ├──┤ dim_episode │
- └────────────┘  └───┬──────────────┘  └────────────┘
+ ┌────────────┐  ┌───▼──────────────┐  ┌─────────────────┐
+ │ dim_zone   ├──┤ fact_taxi_trip    ├──┤ dim_payment_type │
+ └────────────┘  └───┬──────────────┘  └─────────────────┘
                      │
               ┌──────▼───────┐
               │  dim_date     │
@@ -104,19 +104,19 @@ snowflake schema:
 
 | Operation | Description | Example |
 |-----------|-------------|---------|
-| **Slice** | Filter one dimension to a single value | Country = 'SA' |
-| **Dice** | Filter multiple dimensions | Country IN ('SA','AE') AND Platform = 'ios' |
-| **Drill-down** | Move from summary to detail | Year → Quarter → Month → Day |
-| **Roll-up** | Aggregate to a higher level | Episode → Podcast → Category |
+| **Slice** | Filter one dimension to a single value | Borough = 'Manhattan' |
+| **Dice** | Filter multiple dimensions | Borough IN ('Manhattan','Brooklyn') AND payment_type = 'Credit card' |
+| **Drill-down** | Move from summary to detail | Year -> Quarter -> Month -> Day |
+| **Roll-up** | Aggregate to a higher level | Zone -> Borough -> Citywide |
 | **Pivot** | Rotate dimensions | Swap rows and columns |
 
 ### Pre-Aggregation
 
-For large-scale podcast platforms, pre-aggregate common query patterns:
+For large-scale taxi analytics platforms, pre-aggregate common query patterns:
 
-- **Daily listens per podcast** -- Powers the executive dashboard.
-- **Hourly CDN metrics** -- Powers the streaming quality monitor.
-- **Weekly cohort retention** -- Powers the engagement analysis.
+- **Daily trips and revenue by borough** -- Powers the executive dashboard.
+- **Hourly trip volume** -- Powers the demand pattern monitor.
+- **Weekly zone-pair trip counts** -- Powers the geographic route analysis.
 
 ---
 
@@ -139,12 +139,12 @@ For large-scale podcast platforms, pre-aggregate common query patterns:
 │  Title / Date Range Filter                        │
 ├────────┬────────┬────────┬────────┬───────────────┤
 │  KPI 1 │  KPI 2 │  KPI 3 │  KPI 4 │   KPI 5      │
-│  DAU   │ Compl% │ AvgMin │ Revenue│   Churn       │
+│ Trips  │AvgFare │AvgDist │Revenue │  AvgTip%      │
 ├────────┴────────┴────────┴────────┴───────────────┤
 │  Primary Chart (Trend Line / Time Series)          │
 ├─────────────────────┬────────────────────────────-─┤
 │  Secondary Chart 1  │  Secondary Chart 2           │
-│  (Breakdown)        │  (Distribution)              │
+│  (Borough Breakdown)│  (Payment Distribution)      │
 ├─────────────────────┴─────────────────────────────-┤
 │  Data Table (Detail / Drill-down)                  │
 └────────────────────────────────────────────────────┘
@@ -152,92 +152,84 @@ For large-scale podcast platforms, pre-aggregate common query patterns:
 
 ---
 
-## 5. KPIs for a Podcast Platform
+## 5. KPIs for a Taxi Analytics Platform
 
-### User Activity
-
-| KPI | Definition | Formula |
-|-----|------------|---------|
-| **DAU** | Daily Active Users | COUNT(DISTINCT user_id) WHERE event_date = today |
-| **WAU** | Weekly Active Users | COUNT(DISTINCT user_id) WHERE event_date >= today - 7 |
-| **MAU** | Monthly Active Users | COUNT(DISTINCT user_id) WHERE event_date >= today - 30 |
-| **DAU/MAU Ratio** | Stickiness | DAU / MAU (higher = more engaged) |
-
-### Listener Retention & Churn
+### Trip Volume
 
 | KPI | Definition | Formula |
 |-----|------------|---------|
-| **D7 Retention** | % of users active 7 days after signup | Users active on day 7 / Users signed up on day 0 |
-| **Monthly Churn** | % of users lost per month | (MAU_prev - Retained) / MAU_prev |
-| **Resurrection Rate** | Churned users who returned | Reactivated / Previously churned |
+| **Daily Trips** | Total trips completed in a day | COUNT(*) WHERE pickup_date = today |
+| **Trips per Hour** | Average hourly trip volume | COUNT(*) / 24 per day |
+| **Peak Hour Trips** | Max trips in any single hour | MAX(hourly_count) |
+| **Avg Passengers per Trip** | Average passenger count | AVG(passenger_count) |
 
-### Content Engagement
-
-| KPI | Definition | Formula |
-|-----|------------|---------|
-| **Avg Listen Duration** | Average seconds listened per session | AVG(listened_seconds) |
-| **Completion Rate** | % of episode fully listened | COUNT(complete events) / COUNT(play events) |
-| **Episodes per User per Day** | Content consumption depth | COUNT(DISTINCT episode_id) / COUNT(DISTINCT user_id) |
-
-### Top Content
+### Revenue & Fares
 
 | KPI | Definition | Formula |
 |-----|------------|---------|
-| **Top Podcasts** | Podcasts ranked by total listens | GROUP BY podcast_id ORDER BY COUNT(*) DESC |
-| **Trending Episodes** | Episodes with highest growth rate | Compare current vs. previous period listens |
-| **Category Mix** | Distribution of listens across categories | COUNT(*) per category / total COUNT(*) |
+| **Total Revenue** | Sum of all trip fares | SUM(total_amount) |
+| **Average Fare** | Mean fare per trip | AVG(fare_amount) |
+| **Average Tip Percentage** | Tips as a fraction of fare | AVG(tip_amount / NULLIF(fare_amount, 0)) |
+| **Revenue per Mile** | Revenue efficiency | SUM(total_amount) / SUM(trip_distance) |
 
-### Advertising
-
-| KPI | Definition | Formula |
-|-----|------------|---------|
-| **Ad Revenue** | Total ad revenue in SAR | SUM(revenue_sar) |
-| **Fill Rate** | % of ad slots filled | Impressions / Available slots |
-| **CPM** | Cost per thousand impressions | Revenue / Impressions * 1000 |
-| **Click-Through Rate** | % of impressions that got clicks | Clicks / Impressions |
-| **Ad Completion Rate** | % of ads fully watched | Completed / Impressions |
-
-### Streaming Quality
+### Trip Characteristics
 
 | KPI | Definition | Formula |
 |-----|------------|---------|
-| **Rebuffer Rate** | % of sessions with buffering | Sessions with buffer_events > 0 / Total sessions |
-| **Avg Startup Time** | Time to first audio (ms) | AVG(startup_time_ms) |
-| **Error Rate** | % of sessions with errors | Sessions with error_type IS NOT NULL / Total |
-| **P95 Startup Time** | 95th percentile startup latency | PERCENTILE_CONT(0.95) of startup_time_ms |
+| **Avg Trip Distance** | Mean trip distance in miles | AVG(trip_distance) |
+| **Avg Trip Duration** | Mean trip time in minutes | AVG(duration_minutes) |
+| **Avg Speed** | Average trip speed | AVG(trip_distance / NULLIF(duration_hours, 0)) |
+| **Short Trip Rate** | % of trips under 1 mile | COUNT(*) FILTER (WHERE trip_distance < 1) / COUNT(*) |
 
 ### Geographic Distribution
 
 | KPI | Definition | Formula |
 |-----|------------|---------|
-| **Listeners by Country** | User count per country | COUNT(DISTINCT user_id) GROUP BY country |
-| **Top Cities** | City-level concentration | COUNT(DISTINCT user_id) GROUP BY city |
-| **Regional Growth** | Period-over-period by region | Compare current vs. previous period per region |
+| **Trips by Borough** | Trip count per pickup borough | COUNT(*) GROUP BY borough |
+| **Top Pickup Zones** | Zones ranked by trip volume | COUNT(*) GROUP BY PULocationID ORDER BY COUNT(*) DESC |
+| **Top Routes** | Most popular origin-destination pairs | COUNT(*) GROUP BY PULocationID, DOLocationID |
+| **Cross-Borough Rate** | % of trips crossing boroughs | Trips where PU_borough != DO_borough / Total |
+
+### Payment Patterns
+
+| KPI | Definition | Formula |
+|-----|------------|---------|
+| **Payment Type Mix** | Distribution by payment method | COUNT(*) GROUP BY payment_type |
+| **Credit Card Rate** | % of trips paid by credit card | COUNT(credit card) / COUNT(*) |
+| **Avg Tip by Payment** | Average tip by payment type | AVG(tip_amount) GROUP BY payment_type |
+
+### Weather Impact
+
+| KPI | Definition | Formula |
+|-----|------------|---------|
+| **Rainy Day Trip Volume** | Trips on rainy vs. dry days | COUNT(*) on precipitation > 0 days |
+| **Weather Fare Premium** | Fare increase during bad weather | AVG(fare) rainy / AVG(fare) dry |
 
 ---
 
 ## 6. Semantic Layer and Metrics Definitions
 
-A well-defined semantic layer for a podcast platform includes:
+A well-defined semantic layer for a taxi analytics platform includes:
 
 ### Metric Specification Template
 
 ```yaml
-- name: monthly_active_users
-  display_name: "Monthly Active Users (MAU)"
-  description: "Distinct users with at least one listening event in the past 30 days"
-  owner: growth-team
-  type: count_distinct
-  field: user_id
-  source_table: fact_listen_events
+- name: avg_fare_amount
+  display_name: "Average Fare Amount ($)"
+  description: "Mean fare_amount across all completed taxi trips"
+  owner: analytics-team
+  type: average
+  field: fare_amount
+  source_table: fact_taxi_trips
   filters:
-    - "event_date >= CURRENT_DATE - INTERVAL '30 days'"
+    - "fare_amount > 0"
+    - "trip_distance > 0"
   grain: daily
   dimensions:
-    - country
-    - platform
-    - subscription_type
-  tags: [growth, engagement, executive]
+    - borough
+    - payment_type
+    - vendor
+  tags: [revenue, executive]
   sla:
     freshness: "6 hours"
     quality: "99.5%"
@@ -247,12 +239,12 @@ A well-defined semantic layer for a podcast platform includes:
 
 | Type | Description | Example |
 |------|-------------|---------|
-| **count_distinct** | Unique count of a field | MAU, DAU |
+| **count** | Count of records | Total trips |
 | **sum** | Sum of a numeric field | Total revenue |
-| **average** | Average of a numeric field | Avg listen duration |
-| **ratio** | One metric divided by another | Completion rate, CTR |
-| **cumulative** | Running total over time | Cumulative revenue |
-| **period_over_period** | Change vs. previous period | MoM growth |
+| **average** | Average of a numeric field | Avg fare amount |
+| **ratio** | One metric divided by another | Tip percentage, credit card rate |
+| **percentile** | Percentile of a numeric field | P95 trip duration |
+| **period_over_period** | Change vs. previous period | WoW trip volume growth |
 
 ---
 
@@ -287,19 +279,15 @@ module-10-bi-dashboards/
 │   └── metrics.yml                  # YAML metric definitions
 ├── solutions/
 │   ├── executive_dashboard.py       # Exercise 2: Executive summary
-│   ├── podcast_performance.py       # Exercise 3: Podcast deep-dive
-│   ├── user_engagement.py           # Exercise 4: User engagement
-│   ├── ad_revenue.py                # Exercise 5: Ad revenue
-│   ├── streaming_quality.py         # Exercise 6: Streaming quality
-│   ├── geographic_analysis.py       # Exercise 7: Geographic heatmap
-│   └── metrics_definitions.py       # Exercise 8: Programmatic metrics layer
+│   ├── geographic_analysis.py       # Exercise 3: Geographic heatmap & routes
+│   └── metrics_definitions.py       # Exercise 4: Programmatic metrics layer
 └── output/                          # Generated HTML dashboards
 ```
 
 ## Prerequisites
 
 ```bash
-pip install duckdb plotly pandas
+pip install duckdb plotly pandas pyyaml
 ```
 
 ## Running the Dashboards
@@ -309,10 +297,6 @@ pip install duckdb plotly pandas
 cd module-10-bi-dashboards/solutions
 
 python executive_dashboard.py
-python podcast_performance.py
-python user_engagement.py
-python ad_revenue.py
-python streaming_quality.py
 python geographic_analysis.py
 python metrics_definitions.py
 
@@ -329,3 +313,4 @@ open ../output/executive_dashboard.html
 - [Apache Superset documentation](https://superset.apache.org/)
 - [Kimball Group -- Dimensional Modeling Techniques](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/)
 - [Evidence.dev -- BI as Code](https://evidence.dev/)
+- [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)

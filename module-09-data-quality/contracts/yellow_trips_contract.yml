@@ -1,0 +1,102 @@
+name: yellow_tripdata
+owner: taxi-data-team@nyctlc.gov
+description: Yellow taxi trip records from NYC TLC
+version: "1.0"
+
+schema:
+  - name: VendorID
+    type: integer
+    nullable: true
+  - name: tpep_pickup_datetime
+    type: datetime
+    nullable: false
+  - name: tpep_dropoff_datetime
+    type: datetime
+    nullable: false
+  - name: passenger_count
+    type: float
+    nullable: true
+  - name: trip_distance
+    type: float
+    nullable: false
+  - name: RatecodeID
+    type: float
+    nullable: true
+  - name: store_and_fwd_flag
+    type: string
+    nullable: true
+  - name: PULocationID
+    type: integer
+    nullable: false
+  - name: DOLocationID
+    type: integer
+    nullable: false
+  - name: payment_type
+    type: integer
+    nullable: true
+  - name: fare_amount
+    type: float
+    nullable: false
+  - name: tip_amount
+    type: float
+    nullable: false
+  - name: total_amount
+    type: float
+    nullable: false
+
+quality_rules:
+  - column: fare_amount
+    rule: range
+    min: -50
+    max: 5000
+    severity: error
+  - column: trip_distance
+    rule: range
+    min: 0
+    max: 500
+    severity: error
+  - column: passenger_count
+    rule: range
+    min: 0
+    max: 9
+    severity: warning
+  - column: total_amount
+    rule: range
+    min: -100
+    max: 10000
+    severity: error
+  - column: tip_amount
+    rule: range
+    min: 0
+    max: 1000
+    severity: warning
+  - column: PULocationID
+    rule: range
+    min: 1
+    max: 265
+    severity: error
+  - column: DOLocationID
+    rule: range
+    min: 1
+    max: 265
+    severity: error
+  - column: payment_type
+    rule: accepted_values
+    values: [1, 2, 3, 4, 5, 6]
+    severity: warning
+  - column: RatecodeID
+    rule: accepted_values
+    values: [1, 2, 3, 4, 5, 6, 99]
+    severity: warning
+  - column: store_and_fwd_flag
+    rule: accepted_values
+    values: ["Y", "N"]
+    severity: warning
+
+freshness:
+  timestamp_column: tpep_pickup_datetime
+  max_delay_hours: 720
+
+volume:
+  min_rows: 10000
+  max_rows: 5000000
