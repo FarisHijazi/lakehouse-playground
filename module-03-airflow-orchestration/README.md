@@ -8,8 +8,8 @@ the dozens (or hundreds) of data pipelines that keep your platform running.
 workflows as code (Python), schedule them, monitor them through a web UI, and
 handle retries and alerting automatically.
 
-In this module you will learn Airflow from scratch and apply it to our podcast
-platform, building DAGs that move listening-event data through the Bronze, Silver,
+In this module you will learn Airflow from scratch and apply it to our NYC taxi
+data platform, building DAGs that move taxi trip data through the Bronze, Silver,
 and Gold layers of a medallion architecture.
 
 ---
@@ -80,7 +80,7 @@ from airflow.sensors.filesystem import FileSensor
 
 wait_for_file = FileSensor(
     task_id="wait_for_file",
-    filepath="/opt/airflow/data/raw/listening_events/events_{{ ds }}.jsonl",
+    filepath="/opt/airflow/data/raw/yellow_tripdata_2023-01.parquet",
     poke_interval=60,       # Check every 60 seconds
     timeout=3600,           # Give up after 1 hour
     mode="poke",            # Or "reschedule" to free up the worker
@@ -140,6 +140,7 @@ Airflow uses standard cron expressions:
 | `@daily` | Alias for `0 0 * * *` |
 | `@hourly` | Alias for `0 * * * *` |
 | `@weekly` | Alias for `0 0 * * 0` |
+| `@monthly` | Alias for `0 0 1 * *` |
 | `None` | Only triggered manually |
 
 ### The `execution_date` / `logical_date` Concept
@@ -150,15 +151,16 @@ When a DAG runs on a schedule, the `execution_date` (called `logical_date` in
 Airflow 2.2+) represents the **start of the data interval**, not the time the
 DAG actually runs.
 
-Example: A daily DAG scheduled for midnight processes **yesterday's** data.
-The DAG run triggered at `2024-01-02 00:00` has `execution_date = 2024-01-01`.
+Example: A monthly DAG scheduled for the 1st of each month processes the
+**previous month's** data. The DAG run triggered at `2023-02-01 00:00` has
+`execution_date = 2023-01-01`.
 
 This matters because it makes your pipelines **idempotent**: you can re-run the
-same date and get the same result.
+same month and get the same result.
 
 Template variables for use in your DAGs:
-- `{{ ds }}` - The logical date as `YYYY-MM-DD` (e.g., `2024-01-01`)
-- `{{ ds_nodash }}` - Same but without dashes: `20240101`
+- `{{ ds }}` - The logical date as `YYYY-MM-DD` (e.g., `2023-01-01`)
+- `{{ ds_nodash }}` - Same but without dashes: `20230101`
 - `{{ data_interval_start }}` - Start of the data interval (datetime)
 - `{{ data_interval_end }}` - End of the data interval (datetime)
 
@@ -184,7 +186,7 @@ every missed schedule interval between `start_date` and now. This is called
 
 You can also backfill manually from the CLI:
 ```bash
-airflow dags backfill -s 2024-01-01 -e 2024-01-31 my_dag_id
+airflow dags backfill -s 2023-01-01 -e 2023-06-30 my_dag_id
 ```
 
 ---
@@ -208,7 +210,7 @@ airflow dags backfill -s 2024-01-01 -e 2024-01-31 my_dag_id
    }
    ```
 
-5. **Use meaningful task IDs.** `ingest_raw_events` is better than `task_1`.
+5. **Use meaningful task IDs.** `ingest_yellow_trips` is better than `task_1`.
 
 6. **Test locally first.** You can run DAG files as plain Python scripts to check
    for syntax errors: `python my_dag.py`
@@ -235,16 +237,21 @@ airflow dags backfill -s 2024-01-01 -e 2024-01-31 my_dag_id
 ## Architecture in This Module
 
 ```
-Raw JSONL files (data/raw/listening_events/)
+Raw Parquet/CSV files (data/raw/)
+  - yellow_tripdata_2023-XX.parquet
+  - green_tripdata_2023-XX.parquet
+  - taxi_zones.csv, vendors.csv, etc.
         |
         v
-  [Bronze Layer] -- Ingest raw JSONL -> Parquet (partitioned by date)
+  [Bronze Layer] -- Ingest raw Parquet -> partitioned by pickup date
         |
         v
-  [Silver Layer] -- Clean, deduplicate, validate
+  [Silver Layer] -- Clean trips: handle nulls, filter outliers,
+                    add derived columns (duration, speed, etc.)
         |
         v
-  [Gold Layer]   -- Aggregate metrics (daily listens, top episodes, etc.)
+  [Gold Layer]   -- Aggregate metrics (daily trip stats, zone popularity,
+                    revenue summaries)
 ```
 
 Each layer is implemented as a separate DAG, with a final "full pipeline" DAG
@@ -280,7 +287,7 @@ module-03-airflow-orchestration/
 ├── exercises.md                        # Hands-on exercises
 └── dags/
     ├── solution_01_hello_world.py      # Exercise 2: First DAG
-    ├── solution_02_ingest_events.py    # Exercise 3: Raw -> Bronze
+    ├── solution_02_ingest_trips.py     # Exercise 3: Raw -> Bronze
     ├── solution_03_bronze_to_silver.py # Exercise 4: Bronze -> Silver
     ├── solution_04_silver_to_gold.py   # Exercise 5: Silver -> Gold
     └── solution_05_full_pipeline.py    # Exercise 9: Complete pipeline

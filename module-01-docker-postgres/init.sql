@@ -1,191 +1,230 @@
 -- =============================================================================
--- Podcast Platform Schema
+-- NYC Taxi & Limousine Commission — Analytics Schema
 -- =============================================================================
--- This schema is designed for an analytical workload on a podcast platform.
--- Design decisions are documented inline.
+-- Real-world data from the NYC TLC public dataset. This schema supports
+-- yellow taxi, green taxi, and for-hire vehicle (Uber/Lyft) trip records
+-- along with dimension tables for zones, vendors, rates, and weather.
 --
--- Key principles:
---   1. Use TEXT over VARCHAR -- Postgres stores them identically, and TEXT
---      avoids arbitrary length constraints that cause migration headaches.
---   2. Use TIMESTAMPTZ over TIMESTAMP -- always store timezone-aware timestamps.
---      Listeners span multiple timezones (SA, KW, AE, etc.).
---   3. Use domain-specific constraints -- CHECK constraints catch bad data at
---      the database level, not just in application code.
---   4. Natural keys as PRIMARY KEY where they exist (podcast_id, episode_id,
---      user_id) -- these are stable business identifiers, not surrogate keys.
+-- The raw data is naturally messy:
+--   - Null passenger counts, negative fares, zero-distance trips
+--   - Outlier tip amounts, impossible timestamps
+--   - Schema differences between yellow, green, and FHV data
+--   - Rate code 99 = unknown (data quality issue in source)
+--   - Store-and-forward flag inconsistencies across vendors
+--
+-- Design principles:
+--   1. TEXT over VARCHAR — Postgres stores them identically.
+--   2. TIMESTAMPTZ over TIMESTAMP — trips span timezone boundaries.
+--   3. Minimal constraints on fact tables — the raw data IS messy,
+--      and we want to load it as-is for cleaning in later modules.
+--   4. BIGSERIAL PKs on trip tables — no natural key in TLC data.
 -- =============================================================================
 
--- ---------------------------------------------------------------------------
--- podcasts: Core podcast metadata
--- ---------------------------------------------------------------------------
--- One row per podcast. ~10 records. This is a slowly-changing dimension.
-CREATE TABLE podcasts (
-    podcast_id   TEXT PRIMARY KEY,             -- e.g. 'pod_001'
-    name         TEXT NOT NULL,                -- Arabic name
-    name_en      TEXT,                         -- English name (nullable for Arabic-only)
-    category     TEXT NOT NULL,
-    language     TEXT NOT NULL DEFAULT 'ar',   -- 'ar', 'en', 'mixed'
-    host         TEXT NOT NULL,
-    created_at   DATE NOT NULL,
 
-    -- Guard against obviously invalid data
-    CONSTRAINT chk_podcasts_language CHECK (language IN ('ar', 'en', 'mixed'))
+-- ---------------------------------------------------------------------------
+-- taxi_zones: Pickup/dropoff location lookup
+-- ---------------------------------------------------------------------------
+-- 265 taxi zones across NYC's 5 boroughs plus EWR and unknown.
+-- Source: TLC taxi_zone_lookup.csv
+CREATE TABLE taxi_zones (
+    location_id   INTEGER PRIMARY KEY,
+    borough       TEXT NOT NULL,
+    zone          TEXT NOT NULL,
+    service_zone  TEXT NOT NULL
 );
 
-COMMENT ON TABLE podcasts IS 'Podcast-level metadata. One row per show.';
-COMMENT ON COLUMN podcasts.language IS 'Primary language: ar (Arabic), en (English), or mixed.';
+COMMENT ON TABLE taxi_zones IS 'NYC taxi zone lookup — 265 zones across 5 boroughs + EWR.';
+COMMENT ON COLUMN taxi_zones.service_zone IS 'Boro Zone, Yellow Zone, Airports, EWR, or N/A.';
 
 
 -- ---------------------------------------------------------------------------
--- episodes: Individual episode records
+-- vendors: Taxi technology vendors
 -- ---------------------------------------------------------------------------
--- One row per episode. ~784 records. Linked to podcasts via podcast_id.
-CREATE TABLE episodes (
-    episode_id       TEXT PRIMARY KEY,         -- e.g. 'ep_0001'
-    podcast_id       TEXT NOT NULL REFERENCES podcasts(podcast_id),
-    title            TEXT NOT NULL,
-    published_at     TIMESTAMPTZ NOT NULL,
-    duration_seconds INTEGER NOT NULL,
-    season           INTEGER,
-    episode_number   INTEGER,
-
-    -- Duration must be positive and reasonable (max 8 hours)
-    CONSTRAINT chk_episodes_duration CHECK (
-        duration_seconds > 0 AND duration_seconds <= 28800
-    )
+CREATE TABLE vendors (
+    vendor_id    INTEGER PRIMARY KEY,
+    vendor_name  TEXT NOT NULL
 );
 
--- Episodes are almost always queried by podcast. This index supports
--- queries like "all episodes for pod_001 ordered by publish date."
-CREATE INDEX idx_episodes_podcast_id ON episodes(podcast_id);
-CREATE INDEX idx_episodes_published_at ON episodes(published_at);
-
-COMMENT ON TABLE episodes IS 'One row per episode. FK to podcasts.';
-COMMENT ON COLUMN episodes.duration_seconds IS 'Total episode duration in seconds. Max 8 hours (28800s).';
+COMMENT ON TABLE vendors IS 'Yellow/green taxi technology providers (CMT, VeriFone).';
 
 
 -- ---------------------------------------------------------------------------
--- users: Listener profiles
+-- rate_codes: Trip rate classification
 -- ---------------------------------------------------------------------------
--- One row per user. ~5000 records. The raw data is intentionally messy:
--- inconsistent date formats, missing cities, mixed gender values.
--- The load script should clean this; the schema enforces the clean contract.
-CREATE TABLE users (
-    user_id           TEXT PRIMARY KEY,        -- e.g. 'usr_000001'
-    name              TEXT,
-    email             TEXT,
-    country           TEXT,                    -- ISO 2-letter code
-    city              TEXT,                    -- nullable (some users have no city)
-    platform          TEXT,                    -- signup platform
-    signup_date       DATE,
-    subscription_type TEXT,
-    age               INTEGER,
-    gender            TEXT,
-
-    CONSTRAINT chk_users_subscription CHECK (
-        subscription_type IN ('free', 'premium', 'trial')
-    ),
-    CONSTRAINT chk_users_age CHECK (age IS NULL OR (age >= 13 AND age <= 120))
+CREATE TABLE rate_codes (
+    rate_code_id    INTEGER PRIMARY KEY,
+    rate_code_name  TEXT NOT NULL
 );
 
-CREATE INDEX idx_users_country ON users(country);
-CREATE INDEX idx_users_signup_date ON users(signup_date);
-CREATE INDEX idx_users_subscription ON users(subscription_type);
-
-COMMENT ON TABLE users IS 'Listener profiles. Raw data has messy dates/genders -- cleaned on load.';
+COMMENT ON TABLE rate_codes IS 'Rate codes: standard, JFK, Newark, etc. Code 99 = unknown (data quality issue).';
 
 
 -- ---------------------------------------------------------------------------
--- listening_events: The fact table
+-- payment_types: How the fare was paid
 -- ---------------------------------------------------------------------------
--- This is the core analytical table. ~200k rows from daily JSONL files.
--- In a production system this would be partitioned by date; here we keep
--- it simple with proper indexes.
-CREATE TABLE listening_events (
-    event_id         TEXT PRIMARY KEY,         -- UUID
-    user_id          TEXT NOT NULL REFERENCES users(user_id),
-    episode_id       TEXT NOT NULL REFERENCES episodes(episode_id),
-    event_type       TEXT NOT NULL,            -- 'play', 'pause', 'resume', 'complete', 'skip'
-    event_timestamp  TIMESTAMPTZ NOT NULL,
-    listened_seconds INTEGER NOT NULL DEFAULT 0,
-    platform         TEXT,                     -- 'ios', 'android', 'web', etc.
-    country          TEXT,
-    app_version      TEXT,
-
-    CONSTRAINT chk_events_type CHECK (
-        event_type IN ('play', 'pause', 'resume', 'complete', 'skip')
-    ),
-    CONSTRAINT chk_events_listened CHECK (listened_seconds >= 0)
+CREATE TABLE payment_types (
+    payment_type_id    INTEGER PRIMARY KEY,
+    payment_type_name  TEXT NOT NULL
 );
 
--- The most common analytical queries on events:
---   1. "What did user X listen to?" -> idx on user_id
---   2. "How many listens for episode Y?" -> idx on episode_id
---   3. "Daily active listeners" -> idx on timestamp
---   4. Combined filter: user + time range
-CREATE INDEX idx_events_user_id ON listening_events(user_id);
-CREATE INDEX idx_events_episode_id ON listening_events(episode_id);
-CREATE INDEX idx_events_timestamp ON listening_events(event_timestamp);
-CREATE INDEX idx_events_type ON listening_events(event_type);
-
-COMMENT ON TABLE listening_events IS 'Fact table. One row per listening event (~200k rows).';
-COMMENT ON COLUMN listening_events.event_type IS 'One of: play, pause, resume, complete, skip.';
+COMMENT ON TABLE payment_types IS 'Payment methods: credit card, cash, no charge, dispute, etc.';
 
 
 -- ---------------------------------------------------------------------------
--- cdn_logs: Content delivery network telemetry
+-- fhv_bases: For-hire vehicle base/app companies
 -- ---------------------------------------------------------------------------
--- Tracks streaming quality metrics. Useful for reliability/SRE dashboards.
-CREATE TABLE cdn_logs (
-    log_id            TEXT PRIMARY KEY,
-    event_id          TEXT,                    -- FK to listening_events (nullable, not all match)
-    user_id           TEXT,
-    log_timestamp     TIMESTAMPTZ NOT NULL,
-    isp               TEXT,
-    bitrate           TEXT,                    -- e.g. '128kbps', '64kbps'
-    buffer_events     INTEGER DEFAULT 0,
-    rebuffer_ratio    NUMERIC(6,4) DEFAULT 0,
-    startup_time_ms   INTEGER,
-    error_type        TEXT,                    -- nullable (null = no error)
-    cdn_node          TEXT,
-    bytes_transferred BIGINT
-
-    -- No FK on event_id because some CDN logs reference events we may not have loaded.
-    -- In production, this would be a soft reference checked at the application layer.
+CREATE TABLE fhv_bases (
+    base_license_num  TEXT PRIMARY KEY,
+    base_name         TEXT NOT NULL,
+    app_company       TEXT NOT NULL
 );
 
-CREATE INDEX idx_cdn_timestamp ON cdn_logs(log_timestamp);
-CREATE INDEX idx_cdn_user_id ON cdn_logs(user_id);
-CREATE INDEX idx_cdn_error_type ON cdn_logs(error_type) WHERE error_type IS NOT NULL;
-
-COMMENT ON TABLE cdn_logs IS 'CDN delivery telemetry. One row per stream delivery attempt.';
-COMMENT ON COLUMN cdn_logs.rebuffer_ratio IS 'Fraction of playback time spent rebuffering (0.0 = perfect).';
+COMMENT ON TABLE fhv_bases IS 'FHV dispatching bases — Uber (HV0003), Lyft (HV0005), Via, Juno.';
 
 
 -- ---------------------------------------------------------------------------
--- ad_events: Advertising impressions and revenue
+-- yellow_taxi_trips: The main fact table
 -- ---------------------------------------------------------------------------
-CREATE TABLE ad_events (
-    ad_event_id      TEXT PRIMARY KEY,
-    event_id         TEXT,                     -- FK to listening_events
-    user_id          TEXT,
-    ad_timestamp     TIMESTAMPTZ NOT NULL,
-    ad_type          TEXT NOT NULL,            -- 'pre_roll', 'mid_roll', 'post_roll'
-    action           TEXT NOT NULL,            -- 'impression', 'click', 'complete', 'skip'
-    advertiser       TEXT,
-    campaign_id      TEXT,
-    revenue_sar      NUMERIC(10,4) DEFAULT 0,  -- Revenue in Saudi Riyals
-    duration_seconds INTEGER,
-
-    CONSTRAINT chk_ad_type CHECK (ad_type IN ('pre_roll', 'mid_roll', 'post_roll')),
-    CONSTRAINT chk_ad_action CHECK (action IN ('impression', 'click', 'complete', 'skip')),
-    CONSTRAINT chk_ad_revenue CHECK (revenue_sar >= 0)
+-- Millions of rows per month. This is the core analytical table.
+-- Columns match the TLC data dictionary exactly.
+-- Data quality issues in the wild:
+--   - passenger_count is FLOAT in the source (yes, really)
+--   - Negative fare_amount, total_amount (refunds? errors?)
+--   - trip_distance = 0 with non-zero fare
+--   - Pickup datetime after dropoff datetime
+--   - rate_code_id = 99 (unknown)
+--   - vendor_id values changed meaning across years
+CREATE TABLE yellow_taxi_trips (
+    trip_id                 BIGSERIAL PRIMARY KEY,
+    vendor_id               SMALLINT,
+    tpep_pickup_datetime    TIMESTAMPTZ,
+    tpep_dropoff_datetime   TIMESTAMPTZ,
+    passenger_count         DOUBLE PRECISION,  -- float in source data
+    trip_distance           DOUBLE PRECISION,
+    rate_code_id            DOUBLE PRECISION,  -- float in source (contains NaN)
+    store_and_fwd_flag      TEXT,              -- 'Y' or 'N' (or null)
+    pu_location_id          INTEGER,
+    do_location_id          INTEGER,
+    payment_type            BIGINT,
+    fare_amount             DOUBLE PRECISION,
+    extra                   DOUBLE PRECISION,
+    mta_tax                 DOUBLE PRECISION,
+    tip_amount              DOUBLE PRECISION,
+    tolls_amount            DOUBLE PRECISION,
+    improvement_surcharge   DOUBLE PRECISION,
+    total_amount            DOUBLE PRECISION,
+    congestion_surcharge    DOUBLE PRECISION,
+    airport_fee             DOUBLE PRECISION
 );
 
-CREATE INDEX idx_ad_events_user_id ON ad_events(user_id);
-CREATE INDEX idx_ad_events_timestamp ON ad_events(ad_timestamp);
-CREATE INDEX idx_ad_events_campaign ON ad_events(campaign_id);
-CREATE INDEX idx_ad_events_advertiser ON ad_events(advertiser);
+-- The most common analytical queries:
+--   1. "Trips from/to zone X" → index on pickup/dropoff location
+--   2. "Daily trip volume" → index on pickup datetime
+--   3. "Revenue by vendor" → index on vendor
+CREATE INDEX idx_yellow_pickup_dt ON yellow_taxi_trips(tpep_pickup_datetime);
+CREATE INDEX idx_yellow_pu_location ON yellow_taxi_trips(pu_location_id);
+CREATE INDEX idx_yellow_do_location ON yellow_taxi_trips(do_location_id);
+CREATE INDEX idx_yellow_vendor ON yellow_taxi_trips(vendor_id);
 
-COMMENT ON TABLE ad_events IS 'Ad impression/interaction events with revenue tracking.';
-COMMENT ON COLUMN ad_events.revenue_sar IS 'Revenue per event in Saudi Riyals (SAR).';
+COMMENT ON TABLE yellow_taxi_trips IS 'NYC yellow taxi trip records. Millions of rows. Source: TLC.';
+COMMENT ON COLUMN yellow_taxi_trips.passenger_count IS 'Float in source — can be 0, null, or fractional (data quality issue).';
+COMMENT ON COLUMN yellow_taxi_trips.rate_code_id IS 'Float in source — contains NaN. 99 = unknown.';
+
+
+-- ---------------------------------------------------------------------------
+-- green_taxi_trips: Borough taxis (outer boroughs + north Manhattan)
+-- ---------------------------------------------------------------------------
+-- Similar to yellow but with extra columns (ehail_fee, trip_type).
+-- Different pickup datetime column name (lpep_ vs tpep_).
+CREATE TABLE green_taxi_trips (
+    trip_id                 BIGSERIAL PRIMARY KEY,
+    vendor_id               SMALLINT,
+    lpep_pickup_datetime    TIMESTAMPTZ,
+    lpep_dropoff_datetime   TIMESTAMPTZ,
+    passenger_count         DOUBLE PRECISION,
+    trip_distance           DOUBLE PRECISION,
+    rate_code_id            DOUBLE PRECISION,
+    store_and_fwd_flag      TEXT,
+    pu_location_id          INTEGER,
+    do_location_id          INTEGER,
+    payment_type            BIGINT,
+    fare_amount             DOUBLE PRECISION,
+    extra                   DOUBLE PRECISION,
+    mta_tax                 DOUBLE PRECISION,
+    tip_amount              DOUBLE PRECISION,
+    tolls_amount            DOUBLE PRECISION,
+    improvement_surcharge   DOUBLE PRECISION,
+    total_amount            DOUBLE PRECISION,
+    congestion_surcharge    DOUBLE PRECISION,
+    ehail_fee               DOUBLE PRECISION,  -- green-taxi-only field
+    trip_type               DOUBLE PRECISION   -- 1=street-hail, 2=dispatch
+);
+
+CREATE INDEX idx_green_pickup_dt ON green_taxi_trips(lpep_pickup_datetime);
+CREATE INDEX idx_green_pu_location ON green_taxi_trips(pu_location_id);
+CREATE INDEX idx_green_do_location ON green_taxi_trips(do_location_id);
+
+COMMENT ON TABLE green_taxi_trips IS 'NYC green (boro) taxi trips. Different schema from yellow.';
+COMMENT ON COLUMN green_taxi_trips.trip_type IS '1 = street-hail, 2 = dispatch. Float in source.';
+
+
+-- ---------------------------------------------------------------------------
+-- fhv_trips: For-hire vehicle high-volume (Uber, Lyft, Via, Juno)
+-- ---------------------------------------------------------------------------
+-- Completely different schema from yellow/green. Massive volume.
+-- No fare breakdown — just base_passenger_fare and component charges.
+CREATE TABLE fhv_trips (
+    trip_id                 BIGSERIAL PRIMARY KEY,
+    hvfhs_license_num       TEXT,              -- HV0003 = Uber, HV0005 = Lyft
+    dispatching_base_num    TEXT,
+    originating_base_num    TEXT,
+    request_datetime        TIMESTAMPTZ,
+    on_scene_datetime       TIMESTAMPTZ,
+    pickup_datetime         TIMESTAMPTZ,
+    dropoff_datetime        TIMESTAMPTZ,
+    pu_location_id          INTEGER,
+    do_location_id          INTEGER,
+    trip_miles              DOUBLE PRECISION,
+    trip_time               BIGINT,            -- seconds
+    base_passenger_fare     DOUBLE PRECISION,
+    tolls                   DOUBLE PRECISION,
+    bcf                     DOUBLE PRECISION,  -- Black Car Fund
+    sales_tax               DOUBLE PRECISION,
+    congestion_surcharge    DOUBLE PRECISION,
+    airport_fee             DOUBLE PRECISION,
+    tips                    DOUBLE PRECISION,
+    driver_pay              DOUBLE PRECISION,
+    shared_request_flag     TEXT,              -- 'Y' or 'N'
+    shared_match_flag       TEXT,
+    access_a_ride_flag      TEXT,
+    wav_request_flag        TEXT,              -- wheelchair accessible
+    wav_match_flag          TEXT
+);
+
+CREATE INDEX idx_fhv_pickup_dt ON fhv_trips(pickup_datetime);
+CREATE INDEX idx_fhv_pu_location ON fhv_trips(pu_location_id);
+CREATE INDEX idx_fhv_do_location ON fhv_trips(do_location_id);
+CREATE INDEX idx_fhv_license ON fhv_trips(hvfhs_license_num);
+
+COMMENT ON TABLE fhv_trips IS 'For-hire vehicle (Uber/Lyft) trip records. Largest table.';
+COMMENT ON COLUMN fhv_trips.hvfhs_license_num IS 'HV0002=Juno, HV0003=Uber, HV0004=Via, HV0005=Lyft.';
+COMMENT ON COLUMN fhv_trips.trip_time IS 'Trip duration in seconds.';
+
+
+-- ---------------------------------------------------------------------------
+-- daily_weather: NYC Central Park weather station (NOAA)
+-- ---------------------------------------------------------------------------
+-- For enrichment joins: "How does weather affect taxi demand?"
+CREATE TABLE daily_weather (
+    date               DATE PRIMARY KEY,
+    temp_max_f         DOUBLE PRECISION,
+    temp_min_f         DOUBLE PRECISION,
+    temp_avg_f         DOUBLE PRECISION,
+    precipitation_in   DOUBLE PRECISION,
+    snowfall_in        DOUBLE PRECISION,
+    snow_depth_in      DOUBLE PRECISION,
+    wind_speed_mph     DOUBLE PRECISION
+);
+
+COMMENT ON TABLE daily_weather IS 'Daily NYC weather from Central Park station. For enrichment joins.';
+COMMENT ON COLUMN daily_weather.precipitation_in IS 'Total precipitation in inches (rain + melted snow).';

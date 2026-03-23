@@ -30,6 +30,24 @@ Key characteristics:
 In this module, we use PySpark -- the Python API for Spark. It is the most popular interface
 for data engineering work and the standard in Databricks environments.
 
+## The Dataset: NYC Taxi & Limousine Commission (TLC)
+
+This module uses real NYC TLC trip record data, one of the most widely used public datasets
+for data engineering education and benchmarking. The data includes:
+
+- **Yellow taxi trips** (`yellow_tripdata_YYYY-MM.parquet`) -- the iconic NYC yellow cabs
+- **Green taxi trips** (`green_tripdata_YYYY-MM.parquet`) -- street-hail in outer boroughs
+- **For-hire vehicle trips** (`fhvhv_tripdata_YYYY-MM.parquet`) -- Uber, Lyft, etc.
+- **Taxi zone lookup** (`taxi_zone_lookup.csv`) -- 265 zones mapping LocationID to borough/zone
+- **Vendor codes** (`vendors.csv`) -- vendor ID to name mapping
+- **Rate codes** (`rate_codes.csv`) -- rate code descriptions (standard, JFK, Newark, etc.)
+- **Payment types** (`payment_types.csv`) -- cash, credit card, no charge, etc.
+- **NYC weather** (`nyc_weather_2023.csv`) -- daily weather for correlation analysis
+
+The data follows a star schema pattern common in analytics:
+- **Fact table**: Trip records (millions of rows)
+- **Dimension tables**: Zones, vendors, rate codes, payment types (small lookup tables)
+
 ## Spark Architecture
 
 Understanding the architecture is not optional. Every performance problem you encounter in
@@ -79,46 +97,6 @@ processes independently. This is the fundamental unit of parallelism:
 +------------------+     +------------------+     +------------------+
 ```
 
-## RDD vs DataFrame vs Dataset
-
-Spark has evolved through three APIs. Understanding the differences matters because you will
-encounter all three in production code.
-
-### RDD (Resilient Distributed Dataset)
-
-The original Spark abstraction. An RDD is an immutable, distributed collection of objects.
-You operate on it with functional transformations: `map`, `filter`, `reduce`, `flatMap`.
-
-```python
-rdd = sc.textFile("users.csv")
-rdd.filter(lambda line: "premium" in line).count()
-```
-
-RDDs give you full control but no optimization. Spark cannot inspect a lambda function to
-optimize it. The optimizer is blind.
-
-### DataFrame
-
-A distributed collection of rows organized into named columns -- like a table. DataFrames use
-the Catalyst optimizer, which can reorder operations, push down predicates, and generate
-efficient JVM bytecode.
-
-```python
-df = spark.read.csv("users.csv", header=True, inferSchema=True)
-df.filter(df.subscription_type == "premium").count()
-```
-
-DataFrames are the standard API for data engineering. Use them unless you have a specific
-reason not to.
-
-### Dataset (Scala/Java only)
-
-A typed version of DataFrame available in Scala and Java. Not available in PySpark because
-Python is dynamically typed. In PySpark, DataFrame is the primary API.
-
-**Bottom line**: Use DataFrames. They are faster than RDDs (because of Catalyst and Tungsten
-optimization), easier to read, and compatible with Spark SQL.
-
 ## Lazy Evaluation and the Query Plan
 
 This is the single most important concept in Spark. Nothing happens until you trigger an
@@ -129,9 +107,9 @@ action.
 Transformations define what you want to do but do not execute anything:
 
 ```python
-filtered = df.filter(df.country == "SA")          # nothing happens
-selected = filtered.select("user_id", "platform") # nothing happens
-grouped = selected.groupBy("platform").count()     # nothing happens
+filtered = df.filter(df.PULocationID == 132)           # nothing happens
+selected = filtered.select("trip_distance", "fare_amount")  # nothing happens
+grouped = selected.groupBy().avg("fare_amount")         # nothing happens
 ```
 
 Each transformation adds a step to the logical plan. Spark records the recipe but does not
@@ -160,8 +138,7 @@ Because Spark sees the entire plan before executing, it can optimize holisticall
 You can inspect the plan with `.explain()`:
 
 ```python
-df.filter(df.country == "SA").select("user_id").explain(True)
-# Shows: Parsed Logical Plan -> Analyzed Logical Plan -> Optimized Logical Plan -> Physical Plan
+df.filter(df.PULocationID == 132).select("trip_distance").explain(True)
 ```
 
 ## Transformations vs Actions
@@ -175,7 +152,6 @@ These are fast:
 - `filter()` / `where()` -- filter rows
 - `withColumn()` -- add or modify a column
 - `drop()` -- remove a column
-- `map()` (RDD) -- transform each element
 
 ### Wide Transformations
 
@@ -204,73 +180,6 @@ Spark jobs.
 | `write` | Write to storage |
 | `foreach()` | Apply function to each row |
 
-## Spark SQL
-
-Spark SQL lets you query DataFrames using SQL syntax. This is not a separate engine -- it uses
-the same Catalyst optimizer and Tungsten execution engine as the DataFrame API.
-
-```python
-# Register a DataFrame as a temporary view
-df.createOrReplaceTempView("users")
-
-# Query with SQL
-result = spark.sql("""
-    SELECT country, subscription_type, COUNT(*) as user_count
-    FROM users
-    WHERE age > 25
-    GROUP BY country, subscription_type
-    ORDER BY user_count DESC
-""")
-result.show()
-```
-
-When to use SQL vs DataFrame API:
-
-- **SQL**: Complex queries with CTEs, subqueries, window functions -- often more readable
-- **DataFrame API**: Programmatic logic, conditional transformations, reusable pipelines
-- **Performance**: Identical. Both go through the same optimizer.
-
-## Partitioning and Bucketing
-
-### Partitioning (on disk)
-
-Writing data partitioned by a column creates a directory structure:
-
-```python
-df.write.partitionBy("country").parquet("output/users/")
-```
-
-Creates:
-```
-output/users/
-  country=SA/
-    part-00000.parquet
-  country=AE/
-    part-00000.parquet
-  country=KW/
-    part-00000.parquet
-```
-
-When you later filter by `country = 'SA'`, Spark reads only the `country=SA/` directory.
-This is called **partition pruning** and it can reduce I/O by orders of magnitude.
-
-**Rules of thumb:**
-- Partition by columns you frequently filter on (date, country, category)
-- Avoid high-cardinality columns (user_id with millions of values = millions of tiny files)
-- Aim for partition files between 128 MB and 1 GB
-
-### Bucketing (in-memory organization)
-
-Bucketing pre-sorts data into a fixed number of buckets by a column's hash value. This avoids
-shuffles during joins on that column:
-
-```python
-df.write.bucketBy(16, "user_id").sortBy("user_id").saveAsTable("users_bucketed")
-```
-
-If both sides of a join are bucketed by the same column with the same number of buckets, Spark
-performs a **bucket join** with zero shuffle.
-
 ## Broadcast Joins vs Sort-Merge Joins
 
 ### Sort-Merge Join (default for large-large)
@@ -286,7 +195,8 @@ DataFrame. Dramatically faster when one side is small.
 ```python
 from pyspark.sql.functions import broadcast
 
-result = large_df.join(broadcast(small_df), "join_key")
+# Broadcast the small zone lookup table when joining with millions of trips
+result = trips_df.join(broadcast(zones_df), trips_df.PULocationID == zones_df.LocationID)
 ```
 
 Spark automatically broadcasts DataFrames smaller than `spark.sql.autoBroadcastJoinThreshold`
@@ -298,167 +208,151 @@ Spark automatically broadcasts DataFrames smaller than `spark.sql.autoBroadcastJ
 - Both tables large: Sort-merge join (no choice)
 - Frequent joins on same key: Bucketing to avoid repeated shuffles
 
-## Caching and Persistence
+## Partitioning and Bucketing
 
-When you reuse a DataFrame multiple times, cache it to avoid recomputation:
+### Partitioning (on disk)
 
-```python
-df_cached = df.filter(df.country == "SA").cache()
-
-# First action materializes the cache
-df_cached.count()
-
-# Subsequent actions read from cache (fast)
-df_cached.groupBy("platform").count().show()
-df_cached.select("user_id").distinct().count()
-
-# Release memory when done
-df_cached.unpersist()
-```
-
-### Storage Levels
-
-| Level | Memory | Disk | Serialized |
-|-------|--------|------|-----------|
-| `MEMORY_ONLY` | Yes | No | No |
-| `MEMORY_AND_DISK` | Yes | Spill to disk | No |
-| `MEMORY_ONLY_SER` | Yes | No | Yes (smaller) |
-| `DISK_ONLY` | No | Yes | Yes |
-
-`.cache()` is shorthand for `.persist(StorageLevel.MEMORY_AND_DISK)`.
-
-**When to cache:**
-- DataFrame is reused multiple times
-- DataFrame is expensive to compute (complex joins, aggregations)
-- DataFrame fits in memory
-
-**When not to cache:**
-- DataFrame is used only once
-- DataFrame is too large for memory (causes spill and GC pressure)
-- The computation is simple (re-reading Parquet is fast)
-
-## Spark on Databricks vs Standalone
-
-### Standalone (local mode)
-
-What we use in this module:
+Writing data partitioned by a column creates a directory structure:
 
 ```python
-spark = SparkSession.builder.master("local[*]").appName("PodcastAnalytics").getOrCreate()
+df.write.partitionBy("pickup_date").parquet("output/trips/")
 ```
 
-- Runs in a single JVM on your machine
-- Good for development, testing, and small datasets
-- No cluster management, no YARN, no Kubernetes
-- Limited by your machine's RAM and CPU
+Creates:
+```
+output/trips/
+  pickup_date=2023-01-01/
+    part-00000.parquet
+  pickup_date=2023-01-02/
+    part-00000.parquet
+  ...
+```
 
-### Databricks
+When you later filter by `pickup_date = '2023-01-15'`, Spark reads only that directory.
+This is called **partition pruning** and it can reduce I/O by orders of magnitude.
 
-A managed Spark platform that handles cluster provisioning, auto-scaling, job scheduling, and
-notebook collaboration:
+**Rules of thumb:**
+- Partition by columns you frequently filter on (date, borough)
+- Avoid high-cardinality columns (DOLocationID with 265 values may be borderline)
+- Aim for partition files between 128 MB and 1 GB
 
-- **Clusters**: Spin up and down on demand
-- **Notebooks**: Interactive development with inline visualization
-- **Unity Catalog**: Centralized governance for tables and permissions
-- **Delta Lake**: Deeply integrated as the default storage format
-- **Photon**: C++ execution engine that accelerates Spark SQL
-- **Auto-scaling**: Adds/removes executors based on workload
+## Databricks Connection
 
-The PySpark code you write locally works on Databricks with minimal changes -- mainly replacing
-file paths with cloud storage paths (S3, ADLS, GCS) or catalog references.
+The PySpark code in this module runs locally with `master("local[*]")`. The same logic works
+on Databricks with minimal changes. Here is how the key patterns translate:
 
-## Delta Lake Integration with Spark
+### SparkSession
 
-Delta Lake adds ACID transactions, schema enforcement, and time travel to Parquet files. It is
-the storage layer of the lakehouse architecture.
-
-### Writing Delta Tables
+On Databricks, the SparkSession is pre-configured and available as `spark`. You do not need
+to create one:
 
 ```python
-df.write.format("delta").mode("overwrite").save("/path/to/delta/table")
+# Local (this module)
+spark = SparkSession.builder.master("local[*]").appName("TaxiAnalytics").getOrCreate()
+
+# Databricks -- spark is already available, just use it:
+# spark  (no setup required)
 ```
 
-### MERGE (Upsert)
+### Reading Data
 
 ```python
-from delta.tables import DeltaTable
+# Local: read from filesystem
+df = spark.read.parquet("data/raw/yellow_tripdata_2023-01.parquet")
 
-delta_table = DeltaTable.forPath(spark, "/path/to/delta/table")
-delta_table.alias("target").merge(
-    new_data.alias("source"),
-    "target.user_id = source.user_id"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+# Databricks: read from cloud storage or Unity Catalog
+df = spark.read.parquet("dbfs:/mnt/raw/yellow_tripdata_2023-01.parquet")
+df = spark.read.format("delta").load("abfss://container@storage.dfs.core.windows.net/raw/trips")
+df = spark.table("catalog.schema.yellow_trips")  # Unity Catalog
 ```
 
-### Time Travel
+### Displaying Results
 
 ```python
-# Read a previous version
-df_v0 = spark.read.format("delta").option("versionAsOf", 0).load("/path/to/delta/table")
+# Local
+df.show(10)
 
-# Read as of a timestamp
-df_old = spark.read.format("delta").option("timestampAsOf", "2024-01-01").load("/path/to/delta/table")
+# Databricks -- use display() for rich formatting, charts, and pagination
+display(df)
 ```
 
-### VACUUM
+### File Utilities
 
 ```python
-delta_table = DeltaTable.forPath(spark, "/path/to/delta/table")
-delta_table.vacuum(168)  # Delete files older than 168 hours (7 days)
+# Local: use pathlib or os
+from pathlib import Path
+Path("output/").mkdir(exist_ok=True)
+
+# Databricks: use dbutils
+dbutils.fs.ls("/mnt/raw/")
+dbutils.fs.mkdirs("/mnt/output/")
+dbutils.fs.rm("/mnt/output/old_table", recurse=True)
 ```
 
-## Performance Tuning: Shuffle, Skew, Spill
+### Delta Lake
 
-### Shuffle
+```python
+# Local: requires delta-spark package and explicit configuration
+spark = SparkSession.builder \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+    .getOrCreate()
 
-Shuffles move data across partitions. Every `groupBy`, `join`, `orderBy`, and `distinct`
-triggers a shuffle. To minimize shuffle cost:
+# Databricks: Delta is the default format -- no configuration needed
+df.write.format("delta").saveAsTable("catalog.schema.trips_silver")
+```
 
-1. **Reduce data before shuffling**: Filter and select columns early
-2. **Use broadcast joins**: Eliminate shuffle for the large side
-3. **Tune partition count**: `spark.sql.shuffle.partitions` (default 200, often too high for
-   small data, too low for large data)
-4. **Coalesce instead of repartition**: `coalesce(n)` reduces partitions without a full shuffle
+### Databricks-Specific Features
 
-### Data Skew
+- **Photon Engine**: C++ vectorized execution engine. Enable on cluster config for 2-8x speedup.
+- **Adaptive Query Execution (AQE)**: Enabled by default on Databricks.
+- **Delta Live Tables (DLT)**: Declarative pipelines for medallion architecture.
+- **Unity Catalog**: Centralized governance -- `catalog.schema.table` naming.
+- **Serverless SQL Warehouses**: Run SQL queries without managing clusters.
 
-Skew occurs when some partitions have vastly more data than others. One task takes 10 minutes
-while 199 tasks finish in 10 seconds. Solutions:
+### DLT Equivalent of Medallion Pipeline
 
-1. **Salt the key**: Add a random prefix to the skewed key, join, then remove
-2. **Broadcast the smaller side**: Avoid shuffle entirely
-3. **AQE (Adaptive Query Execution)**: Spark 3.x can detect skew at runtime and split large
-   partitions (`spark.sql.adaptive.enabled = true`)
-4. **Filter out the skewed values**: Handle them separately
+```python
+# In a Databricks DLT notebook, Exercise 08 (medallion) becomes declarative:
+import dlt
+from pyspark.sql.functions import col
 
-### Spill
+@dlt.table(comment="Raw yellow taxi trips")
+def bronze_trips():
+    return spark.read.parquet("/mnt/raw/yellow_tripdata_*.parquet")
 
-Spill occurs when a partition does not fit in memory and must be written to disk temporarily.
-Signs of spill:
+@dlt.table(comment="Cleaned trips with valid fares")
+@dlt.expect_or_drop("valid_fare", "fare_amount > 0")
+def silver_trips():
+    return (
+        dlt.read("bronze_trips")
+        .filter(col("trip_distance") > 0)
+        .withColumn("trip_duration_minutes",
+            (col("tpep_dropoff_datetime").cast("long") - col("tpep_pickup_datetime").cast("long")) / 60)
+    )
 
-- Slow tasks in the Spark UI showing "Spill (Memory)" and "Spill (Disk)"
-- High GC (garbage collection) time
-
-Solutions:
-1. Increase executor memory: `spark.executor.memory`
-2. Increase partitions: More partitions = smaller partitions = less memory per partition
-3. Reduce data size: Filter earlier, select fewer columns
-4. Avoid `collect()` and `toPandas()` on large DataFrames
+@dlt.table(comment="Hourly revenue by borough")
+def gold_hourly_revenue():
+    return (
+        dlt.read("silver_trips")
+        .groupBy("pickup_borough", "pickup_hour")
+        .agg(sum("total_amount").alias("total_revenue"))
+    )
+```
 
 ## What You Will Build
 
-In this module, you will use PySpark to process the podcast platform dataset:
+In this module, you will use PySpark to process NYC taxi trip data:
 
-- **10 podcasts** with Arabic and English metadata
-- **784 episodes** across multiple seasons
-- **5,000 users** with messy data (inconsistent date formats, missing values, mixed gender labels)
-- **~200,000 listening events** in daily JSONL files
-- **50,000 CDN log entries** with network performance data
-- **Ad events** with revenue and engagement data
+- **Millions of taxi trips** with pickup/dropoff locations, fares, tips, and timestamps
+- **265 taxi zones** across 5 boroughs
+- **Multiple trip types** -- yellow cab, green cab, and for-hire vehicles
+- **Weather data** for correlation analysis
+- **Dimension tables** for vendors, rate codes, and payment types
 
 You will start with basic DataFrame operations and progressively build a full
 Bronze-Silver-Gold medallion pipeline in PySpark, learning optimization techniques along the
-way.
+way. Every exercise includes comments showing the Databricks equivalent.
 
 ## Prerequisites
 

@@ -1,14 +1,15 @@
 # Module 08: Streaming Exercises
 
-## Exercise 1: Build a Streaming Event Producer
+## Exercise 1: Build a Streaming Trip Producer
 
-Create a Python script that simulates a real-time stream of podcast listening events.
+Create a Python script that simulates real-time taxi trip arrivals by reading from
+parquet files and emitting trips row by row.
 
 **Requirements:**
-- Generate events at realistic rates (more in evening hours, less at night)
-- Events should follow the same schema as our listening events data
-- Add realistic latency (some events arrive late)
-- Support configurable event rate (events per second)
+- Read yellow taxi trip parquet files from `data/raw/`
+- Emit trips at realistic rates (more during rush hours, less at night)
+- Add realistic late-arriving events (delayed meter uploads)
+- Support configurable trip rate (trips per second)
 
 **Concepts:** Event generation, timestamps, realistic traffic patterns
 
@@ -16,12 +17,12 @@ Create a Python script that simulates a real-time stream of podcast listening ev
 
 ## Exercise 2: Build a Simple Stream Consumer
 
-Create a consumer that reads events from the producer and computes running aggregates.
+Create a consumer that reads trip events from the producer and computes running aggregates.
 
 **Requirements:**
-- Count total events processed
-- Track events per event type (play, pause, skip, complete)
-- Compute running average listen duration
+- Count total trips processed
+- Track trips by payment type and rate code
+- Compute running average fare amount and trip distance
 - Print stats every 5 seconds
 
 **Concepts:** Consumer loop, running aggregations, state management
@@ -30,80 +31,53 @@ Create a consumer that reads events from the producer and computes running aggre
 
 ## Exercise 3: Tumbling Window Aggregation
 
-Implement tumbling (fixed) windows to count listeners per episode in 5-minute windows.
+Implement 5-minute tumbling windows to aggregate taxi trip metrics.
 
 **Requirements:**
 - Each window is exactly 5 minutes, no overlap
-- Count unique listeners per episode per window
+- Count trips, sum fares, compute average distance per window
 - Emit results when the window closes
-- Handle events arriving within the window
+- Handle trips arriving within the window
 
 **Concepts:** Tumbling windows, windowed aggregation, window lifecycle
 
 ---
 
-## Exercise 4: Sliding Window Aggregation
+## Exercise 4: Session Windows
 
-Implement sliding windows for moving averages.
-
-**Requirements:**
-- 10-minute window, sliding every 2 minutes
-- Compute moving average of concurrent listeners
-- Compare with tumbling window results
-
-**Concepts:** Sliding windows, overlapping computation
-
----
-
-## Exercise 5: Session Windows
-
-Group user events into listening sessions.
+Group trips by pickup zone into "busy periods" based on activity gaps.
 
 **Requirements:**
-- A session starts with a "play" event
-- A session ends after 5 minutes of inactivity from the same user
-- Track: session duration, episodes listened, total listen time
-- Identify "binge listeners" (sessions > 1 hour)
+- A busy period starts when a trip is picked up in a zone
+- A busy period ends after N minutes of no pickups in that zone
+- Track: busy period duration, total trips, total revenue per zone
+- Identify "surge zones" (busy periods with many trips in a short time)
 
 **Concepts:** Session windows, per-key state, gap detection
 
 ---
 
-## Exercise 6: Late Event Handling with Watermarks
+## Exercise 5: Late Event Handling with Watermarks
 
-Handle events that arrive after their window has closed.
+Handle taxi trips that arrive after their window has closed (delayed meter uploads).
 
 **Requirements:**
-- Set a watermark at max_event_time - 30 seconds
-- Events within the watermark update the window
-- Events beyond the watermark go to a "late events" side output
-- Count and report how many late events were dropped vs. processed
+- Set a watermark at max_event_time - allowed_lateness
+- Trips within the watermark update the window
+- Trips beyond the watermark go to a "late trips" side output
+- Count and report how many late trips were dropped vs processed
 
 **Concepts:** Watermarks, late data, allowed lateness
 
 ---
 
-## Exercise 7: Stream-to-File Sink
+## Exercise 6: Simulated Kafka System
 
-Write windowed aggregation results to Parquet files.
-
-**Requirements:**
-- Every completed window writes a Parquet file
-- Files are partitioned by window_start date
-- Support append mode (don't overwrite previous windows)
-- Include metadata: window_start, window_end, record_count
-
-**Concepts:** Sinks, file output, exactly-once file writes
-
----
-
-## Exercise 8: Simulated Kafka System
-
-Build a complete simulated Kafka system using Python threading.
+Build a complete simulated Kafka system for taxi trip events using Python threading.
 
 **Requirements:**
 - Implement Topic class with partitions
-- Implement Producer with partitioning by key
+- Implement Producer with partitioning by zone (PULocationID)
 - Implement Consumer and ConsumerGroup with offset tracking
 - Support multiple consumer groups reading the same topic independently
 - Demonstrate rebalancing when a consumer joins/leaves
@@ -112,15 +86,15 @@ Build a complete simulated Kafka system using Python threading.
 
 ---
 
-## Exercise 9: Real-Time Dashboard Metrics
+## Exercise 7: Real-Time Dashboard Metrics
 
-Build a system that continuously computes dashboard metrics.
+Build a system that continuously computes dashboard-ready metrics from the trip stream.
 
 **Requirements:**
-- Concurrent listeners right now (count distinct users with play events in last 5 min)
-- Trending episodes (most plays in last 30 minutes, compared to previous 30 min)
-- CDN health score (avg rebuffer rate in last 10 minutes, alert if > 5%)
-- Geographic hotspots (top countries by active listeners)
+- Trips per minute by borough (Manhattan, Brooklyn, Queens, Bronx, Staten Island)
+- Running revenue totals (fares + tips) by payment type
+- Surge detection: flag zones where average fare exceeds 2x the rolling average
+- Airport trip monitoring (JFK, LaGuardia, Newark zones)
 
 **Concepts:** Complex event processing, multi-metric computation, alerting
 

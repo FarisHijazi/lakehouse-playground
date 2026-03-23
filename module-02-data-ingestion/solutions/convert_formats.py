@@ -1,30 +1,26 @@
 """
-Module 02 - Exercise 2: Convert CSV/JSON to Parquet
-====================================================
+Module 02 - Exercise 2: Convert Taxi Data Formats
+===================================================
 
-This script converts every raw data source from its original format (CSV, JSON,
-JSONL) into Parquet with explicit PyArrow schemas and Snappy compression.
+This script demonstrates format conversion and tradeoffs using real NYC taxi data.
 
-Why Parquet?
-- Columnar storage: only reads the columns your query needs (column pruning).
-- Built-in compression: Snappy gives 5-10x size reduction over CSV.
-- Embedded schema: data types are stored in the file, no guessing.
-- Predicate pushdown: query engines can skip row groups that don't match filters.
+The TLC already distributes trip data as Parquet (they switched from CSV in 2022).
+This is a great case study: we convert Parquet to CSV and JSON to see WHY the TLC
+chose Parquet, and we also convert the small CSV dimension tables to Parquet for
+consistency in our lakehouse.
 
 Key design decisions:
-- We define explicit schemas instead of relying on pandas type inference.
+- We define explicit PyArrow schemas instead of relying on pandas type inference.
   Inference is fragile -- a column of "1, 2, 3, NA" might be inferred as float
   when you intended int.  Explicit schemas catch type mismatches early.
 - We write to data/processed/bronze/ because this is a raw-to-bronze conversion
-  (no cleaning yet, just format change).
+  (no cleaning yet, just format change and schema enforcement).
 
 Usage:
     python solutions/convert_formats.py
 """
 
-import json
 import logging
-import os
 from glob import glob
 from pathlib import Path
 
@@ -51,77 +47,59 @@ BRONZE_DIR = PROJECT_ROOT / "data" / "processed" / "bronze"
 # shape of your data and causes a loud failure if the source data changes in
 # an unexpected way (e.g., a column is renamed or a new type appears).
 
-PODCASTS_SCHEMA = pa.schema([
-    pa.field("podcast_id", pa.string()),
-    pa.field("name", pa.string()),
-    pa.field("name_en", pa.string()),
-    pa.field("category", pa.string()),
-    pa.field("language", pa.string()),
-    pa.field("host", pa.string()),
-    pa.field("created_at", pa.string()),  # Keep as string in bronze; parse in silver
+YELLOW_TAXI_SCHEMA = pa.schema([
+    pa.field("VendorID", pa.int64()),
+    pa.field("tpep_pickup_datetime", pa.timestamp("us")),
+    pa.field("tpep_dropoff_datetime", pa.timestamp("us")),
+    pa.field("passenger_count", pa.float64()),     # float because source has NaN
+    pa.field("trip_distance", pa.float64()),
+    pa.field("RatecodeID", pa.float64()),           # float because source has NaN
+    pa.field("store_and_fwd_flag", pa.string()),
+    pa.field("PULocationID", pa.int64()),
+    pa.field("DOLocationID", pa.int64()),
+    pa.field("payment_type", pa.int64()),
+    pa.field("fare_amount", pa.float64()),
+    pa.field("extra", pa.float64()),
+    pa.field("mta_tax", pa.float64()),
+    pa.field("tip_amount", pa.float64()),
+    pa.field("tolls_amount", pa.float64()),
+    pa.field("improvement_surcharge", pa.float64()),
+    pa.field("total_amount", pa.float64()),
+    pa.field("congestion_surcharge", pa.float64()),
+    pa.field("airport_fee", pa.float64()),
 ])
 
-EPISODES_SCHEMA = pa.schema([
-    pa.field("episode_id", pa.string()),
-    pa.field("podcast_id", pa.string()),
-    pa.field("title", pa.string()),
-    pa.field("published_at", pa.string()),
-    pa.field("duration_seconds", pa.int32()),
-    pa.field("season", pa.int32()),
-    pa.field("episode_number", pa.int32()),
+TAXI_ZONES_SCHEMA = pa.schema([
+    pa.field("LocationID", pa.int32()),
+    pa.field("Borough", pa.string()),
+    pa.field("Zone", pa.string()),
+    pa.field("service_zone", pa.string()),
 ])
 
-USERS_SCHEMA = pa.schema([
-    pa.field("user_id", pa.string()),
-    pa.field("name", pa.string()),
-    pa.field("email", pa.string()),
-    pa.field("country", pa.string()),
-    pa.field("city", pa.string()),
-    pa.field("platform", pa.string()),
-    pa.field("signup_date", pa.string()),  # Mixed formats -- keep as string in bronze
-    pa.field("subscription_type", pa.string()),
-    pa.field("age", pa.float64()),  # float because of nulls (pandas int limitation)
-    pa.field("gender", pa.string()),
+VENDORS_SCHEMA = pa.schema([
+    pa.field("vendor_id", pa.int32()),
+    pa.field("vendor_name", pa.string()),
 ])
 
-LISTENING_EVENTS_SCHEMA = pa.schema([
-    pa.field("event_id", pa.string()),
-    pa.field("user_id", pa.string()),
-    pa.field("episode_id", pa.string()),
-    pa.field("event_type", pa.string()),
-    pa.field("timestamp", pa.string()),
-    pa.field("listened_seconds", pa.int64()),
-    pa.field("platform", pa.string()),
-    pa.field("country", pa.string()),
-    pa.field("app_version", pa.string()),
+RATE_CODES_SCHEMA = pa.schema([
+    pa.field("rate_code_id", pa.int32()),
+    pa.field("rate_code_name", pa.string()),
 ])
 
-CDN_LOGS_SCHEMA = pa.schema([
-    pa.field("log_id", pa.string()),
-    pa.field("event_id", pa.string()),
-    pa.field("user_id", pa.string()),
-    pa.field("timestamp", pa.string()),
-    pa.field("isp", pa.string()),
-    pa.field("bitrate", pa.string()),
-    pa.field("buffer_events", pa.int32()),
-    pa.field("rebuffer_ratio", pa.float64()),
-    pa.field("startup_time_ms", pa.int32()),
-    pa.field("error_type", pa.string()),
-    pa.field("cdn_node", pa.string()),
-    pa.field("bytes_transferred", pa.int64()),
+PAYMENT_TYPES_SCHEMA = pa.schema([
+    pa.field("payment_type_id", pa.int32()),
+    pa.field("payment_type_name", pa.string()),
 ])
 
-AD_EVENTS_SCHEMA = pa.schema([
-    pa.field("ad_event_id", pa.string()),
-    pa.field("event_id", pa.string()),
-    pa.field("user_id", pa.string()),
-    pa.field("timestamp", pa.string()),
-    pa.field("ad_type", pa.string()),
-    pa.field("action", pa.string()),
-    pa.field("advertiser", pa.string()),
-    pa.field("campaign_id", pa.string()),
-    pa.field("revenue_sar", pa.float64()),
-    pa.field("duration_seconds", pa.float64()),
+WEATHER_SCHEMA = pa.schema([
+    pa.field("date", pa.string()),             # Keep as string in bronze; parse in silver
+    pa.field("temp_max_f", pa.float64()),
+    pa.field("temp_min_f", pa.float64()),
+    pa.field("temp_avg_f", pa.float64()),
+    pa.field("precipitation_in", pa.float64()),
+    pa.field("snowfall_in", pa.float64()),
+    pa.field("snow_depth_in", pa.float64()),
+    pa.field("wind_speed_mph", pa.float64()),
 ])
 
 
@@ -133,11 +111,7 @@ def get_file_size_mb(path: Path) -> float:
 
 
 def write_parquet(df: pd.DataFrame, schema: pa.Schema, output_path: Path, name: str) -> None:
-    """Convert a DataFrame to a PyArrow Table with an explicit schema and write Parquet.
-
-    The explicit schema cast is the important part.  Without it, pandas will
-    silently infer types that may not match what downstream consumers expect.
-    """
+    """Convert a DataFrame to a PyArrow Table with an explicit schema and write Parquet."""
     try:
         table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
     except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
@@ -151,86 +125,152 @@ def write_parquet(df: pd.DataFrame, schema: pa.Schema, output_path: Path, name: 
 
 
 def main() -> None:
-    log.info("Converting raw data to Parquet (bronze layer)")
+    log.info("Converting raw NYC taxi data to bronze layer")
     log.info("Output directory: %s", BRONZE_DIR)
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
 
     results = []  # (name, original_mb, parquet_mb)
 
-    # ---- Podcasts ----------------------------------------------------------
-    log.info("Converting podcasts.json ...")
-    src = RAW_DIR / "podcasts.json"
-    with open(src) as f:
-        podcasts = pd.DataFrame(json.load(f))
-    out = BRONZE_DIR / "podcasts.parquet"
-    write_parquet(podcasts, PODCASTS_SCHEMA, out, "podcasts")
-    results.append(("podcasts", get_file_size_mb(src), get_file_size_mb(out)))
+    # ---- Yellow Taxi Trips -------------------------------------------------
+    # The TLC distributes trip data as Parquet already. We re-write with an
+    # explicit schema to catch any schema drift, and also convert to CSV/JSON
+    # to demonstrate the size difference.
+    yellow_files = sorted(glob(str(RAW_DIR / "yellow_tripdata_*.parquet")))
+    if yellow_files:
+        # Process the first file for format comparison demo
+        src_path = Path(yellow_files[0])
+        log.info("Converting %s ...", src_path.name)
+        df = pd.read_parquet(src_path)
+        log.info("  Loaded %d rows, %d columns", len(df), len(df.columns))
 
-    # ---- Episodes ----------------------------------------------------------
-    log.info("Converting episodes.json ...")
-    src = RAW_DIR / "episodes.json"
-    with open(src) as f:
-        episodes = pd.DataFrame(json.load(f))
-    out = BRONZE_DIR / "episodes.parquet"
-    write_parquet(episodes, EPISODES_SCHEMA, out, "episodes")
-    results.append(("episodes", get_file_size_mb(src), get_file_size_mb(out)))
+        # Limit to a sample for CSV/JSON to avoid massive files
+        sample_size = min(100_000, len(df))
+        df_sample = df.head(sample_size).copy()
+        log.info("  Using %d rows for format comparison", sample_size)
 
-    # ---- Users -------------------------------------------------------------
-    log.info("Converting users.csv ...")
-    src = RAW_DIR / "users.csv"
-    users = pd.read_csv(src, dtype=str)  # Read everything as string for bronze
-    out = BRONZE_DIR / "users.parquet"
-    write_parquet(users, USERS_SCHEMA, out, "users")
-    results.append(("users", get_file_size_mb(src), get_file_size_mb(out)))
+        # Write as Parquet (with explicit schema)
+        out_pq = BRONZE_DIR / src_path.name
+        write_parquet(df, YELLOW_TAXI_SCHEMA, out_pq, "yellow_taxi (parquet)")
+        results.append(("yellow_taxi.parquet", get_file_size_mb(src_path), get_file_size_mb(out_pq)))
 
-    # ---- Listening Events --------------------------------------------------
-    log.info("Converting listening_events (JSONL files) ...")
-    events_dir = RAW_DIR / "listening_events"
-    jsonl_files = sorted(glob(str(events_dir / "events_*.jsonl")))
-    frames = []
-    for fpath in jsonl_files:
-        try:
-            frames.append(pd.read_json(fpath, lines=True))
-        except Exception as exc:
-            log.warning("Skipping %s: %s", fpath, exc)
-    events = pd.concat(frames, ignore_index=True)
-    # Convert listened_seconds to int (fill nulls with 0 first)
-    events["listened_seconds"] = pd.to_numeric(events["listened_seconds"], errors="coerce").fillna(0).astype(int)
-    # Convert timestamp to string for bronze layer (keep raw, parse in silver)
-    events["timestamp"] = events["timestamp"].astype(str)
-    out = BRONZE_DIR / "listening_events.parquet"
-    write_parquet(events, LISTENING_EVENTS_SCHEMA, out, "listening_events")
-    results.append(("listening_events", get_file_size_mb(events_dir), get_file_size_mb(out)))
+        # Write sample as CSV to show size difference
+        out_csv = BRONZE_DIR / src_path.name.replace(".parquet", ".csv")
+        # Convert timestamps to string for CSV
+        df_csv = df_sample.copy()
+        for col in df_csv.select_dtypes(include=["datetime", "datetimetz"]).columns:
+            df_csv[col] = df_csv[col].astype(str)
+        df_csv.to_csv(out_csv, index=False)
+        log.info("  Wrote %s (%.2f MB) [%d rows]", out_csv.name, get_file_size_mb(out_csv), sample_size)
+        results.append((f"yellow_taxi.csv ({sample_size:,} rows)", get_file_size_mb(out_csv), None))
 
-    # ---- CDN Logs ----------------------------------------------------------
-    log.info("Converting cdn_logs.csv ...")
-    src = RAW_DIR / "cdn_logs.csv"
-    cdn = pd.read_csv(src)
-    out = BRONZE_DIR / "cdn_logs.parquet"
-    write_parquet(cdn, CDN_LOGS_SCHEMA, out, "cdn_logs")
-    results.append(("cdn_logs", get_file_size_mb(src), get_file_size_mb(out)))
+        # Write sample as JSON (line-delimited) to show size difference
+        out_json = BRONZE_DIR / src_path.name.replace(".parquet", ".jsonl")
+        df_csv.to_json(out_json, orient="records", lines=True)
+        log.info("  Wrote %s (%.2f MB) [%d rows]", out_json.name, get_file_size_mb(out_json), sample_size)
+        results.append((f"yellow_taxi.jsonl ({sample_size:,} rows)", get_file_size_mb(out_json), None))
 
-    # ---- Ad Events ---------------------------------------------------------
-    log.info("Converting ad_events.json ...")
-    src = RAW_DIR / "ad_events.json"
-    with open(src) as f:
-        ads = pd.DataFrame(json.load(f))
-    out = BRONZE_DIR / "ad_events.parquet"
-    write_parquet(ads, AD_EVENTS_SCHEMA, out, "ad_events")
-    results.append(("ad_events", get_file_size_mb(src), get_file_size_mb(out)))
+        # Process remaining yellow files (Parquet only)
+        for fpath in yellow_files[1:]:
+            src = Path(fpath)
+            log.info("Converting %s ...", src.name)
+            df2 = pd.read_parquet(src)
+            out2 = BRONZE_DIR / src.name
+            write_parquet(df2, YELLOW_TAXI_SCHEMA, out2, src.name)
+            results.append((src.name, get_file_size_mb(src), get_file_size_mb(out2)))
+    else:
+        log.warning("No yellow taxi Parquet files found in %s", RAW_DIR)
+
+    # ---- Green Taxi Trips --------------------------------------------------
+    green_files = sorted(glob(str(RAW_DIR / "green_tripdata_*.parquet")))
+    for fpath in green_files:
+        src = Path(fpath)
+        log.info("Converting %s ...", src.name)
+        df = pd.read_parquet(src)
+        out = BRONZE_DIR / src.name
+        # Green taxi has a slightly different schema; use inferred for bronze
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table, str(out), compression="snappy")
+        log.info("  Wrote %s (%.2f MB)", out.name, get_file_size_mb(out))
+        results.append((src.name, get_file_size_mb(src), get_file_size_mb(out)))
+
+    # ---- FHV Trips ---------------------------------------------------------
+    fhv_files = sorted(glob(str(RAW_DIR / "fhvhv_tripdata_*.parquet")))
+    for fpath in fhv_files:
+        src = Path(fpath)
+        log.info("Converting %s ...", src.name)
+        df = pd.read_parquet(src)
+        out = BRONZE_DIR / src.name
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table, str(out), compression="snappy")
+        log.info("  Wrote %s (%.2f MB)", out.name, get_file_size_mb(out))
+        results.append((src.name, get_file_size_mb(src), get_file_size_mb(out)))
+
+    # ---- Taxi Zones (CSV -> Parquet) ---------------------------------------
+    zones_path = RAW_DIR / "taxi_zone_lookup.csv"
+    if zones_path.exists():
+        log.info("Converting taxi_zone_lookup.csv ...")
+        zones = pd.read_csv(zones_path)
+        out = BRONZE_DIR / "taxi_zones.parquet"
+        write_parquet(zones, TAXI_ZONES_SCHEMA, out, "taxi_zones")
+        results.append(("taxi_zones", get_file_size_mb(zones_path), get_file_size_mb(out)))
+    else:
+        log.warning("taxi_zone_lookup.csv not found")
+
+    # ---- Vendors (CSV -> Parquet) ------------------------------------------
+    vendors_path = RAW_DIR / "vendors.csv"
+    if vendors_path.exists():
+        log.info("Converting vendors.csv ...")
+        vendors = pd.read_csv(vendors_path)
+        out = BRONZE_DIR / "vendors.parquet"
+        write_parquet(vendors, VENDORS_SCHEMA, out, "vendors")
+        results.append(("vendors", get_file_size_mb(vendors_path), get_file_size_mb(out)))
+
+    # ---- Rate Codes (CSV -> Parquet) ---------------------------------------
+    rates_path = RAW_DIR / "rate_codes.csv"
+    if rates_path.exists():
+        log.info("Converting rate_codes.csv ...")
+        rates = pd.read_csv(rates_path)
+        out = BRONZE_DIR / "rate_codes.parquet"
+        write_parquet(rates, RATE_CODES_SCHEMA, out, "rate_codes")
+        results.append(("rate_codes", get_file_size_mb(rates_path), get_file_size_mb(out)))
+
+    # ---- Payment Types (CSV -> Parquet) ------------------------------------
+    pay_path = RAW_DIR / "payment_types.csv"
+    if pay_path.exists():
+        log.info("Converting payment_types.csv ...")
+        pay = pd.read_csv(pay_path)
+        out = BRONZE_DIR / "payment_types.parquet"
+        write_parquet(pay, PAYMENT_TYPES_SCHEMA, out, "payment_types")
+        results.append(("payment_types", get_file_size_mb(pay_path), get_file_size_mb(out)))
+
+    # ---- Weather (CSV -> Parquet) ------------------------------------------
+    weather_files = sorted(glob(str(RAW_DIR / "nyc_weather_*.csv")))
+    for fpath in weather_files:
+        src = Path(fpath)
+        log.info("Converting %s ...", src.name)
+        weather = pd.read_csv(src)
+        out = BRONZE_DIR / "nyc_weather.parquet"
+        write_parquet(weather, WEATHER_SCHEMA, out, "weather")
+        results.append(("nyc_weather", get_file_size_mb(src), get_file_size_mb(out)))
 
     # ---- Summary table -----------------------------------------------------
     log.info("")
-    log.info("=" * 60)
-    log.info("SIZE COMPARISON: Raw vs Parquet (Snappy)")
-    log.info("=" * 60)
-    log.info("%-20s  %10s  %10s  %10s", "Dataset", "Raw (MB)", "Parquet", "Ratio")
-    log.info("-" * 60)
-    for name, raw_mb, pq_mb in results:
-        ratio = raw_mb / pq_mb if pq_mb > 0 else float("inf")
-        log.info("%-20s  %10.2f  %10.2f  %9.1fx", name, raw_mb, pq_mb, ratio)
+    log.info("=" * 65)
+    log.info("SIZE COMPARISON: Raw vs Bronze")
+    log.info("=" * 65)
+    log.info("%-40s  %10s  %10s  %8s", "Dataset", "Raw (MB)", "Bronze", "Ratio")
+    log.info("-" * 65)
+    for name, raw_mb, bronze_mb in results:
+        if bronze_mb is not None and bronze_mb > 0:
+            ratio = raw_mb / bronze_mb
+            log.info("%-40s  %10.2f  %10.2f  %7.1fx", name, raw_mb, bronze_mb, ratio)
+        else:
+            log.info("%-40s  %10.2f  %10s  %8s", name, raw_mb, "---", "---")
     log.info("")
-    log.info("Done. Bronze Parquet files written to: %s", BRONZE_DIR)
+    log.info("Done. Bronze files written to: %s", BRONZE_DIR)
+    log.info("")
+    log.info("Key takeaway: The TLC distributes data as Parquet for good reason.")
+    log.info("CSV and JSON versions of the same data are 3-10x larger on disk.")
 
 
 if __name__ == "__main__":

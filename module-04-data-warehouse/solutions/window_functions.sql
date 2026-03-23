@@ -2,7 +2,7 @@
 -- Module 04: Window Functions -- Solutions
 -- =============================================================================
 -- These queries run against the star schema in warehouse.duckdb.
--- Each demonstrates a different window function pattern.
+-- Each demonstrates a different window function pattern on NYC taxi data.
 --
 -- Window functions perform calculations across a set of rows RELATED to the
 -- current row, without collapsing them like GROUP BY. The key clauses are:
@@ -11,9 +11,9 @@
 
 
 -- =============================================================================
--- Exercise 7a: Running Total of Listens Per Podcast
+-- Exercise 7a: Running Total of Daily Revenue by Borough
 -- =============================================================================
--- Window: PARTITION BY podcast, ORDER BY date
+-- Window: PARTITION BY borough, ORDER BY date
 -- Function: SUM() as a running (cumulative) total
 --
 -- The frame defaults to ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -21,68 +21,72 @@
 -- up to and including the current row's date.
 -- =============================================================================
 
-WITH daily_counts AS (
-    -- First aggregate to daily level per podcast
+WITH daily_revenue AS (
     SELECT
-        p.name_en AS podcast_name,
-        f.event_date,
-        COUNT(*) AS daily_listens
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-    GROUP BY p.name_en, f.event_date
+        z.borough,
+        CAST(f.pickup_datetime AS DATE)   AS pickup_date,
+        ROUND(SUM(f.total_amount), 2)     AS daily_revenue,
+        COUNT(*)                          AS daily_trips
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough != 'Unknown'
+    GROUP BY z.borough, CAST(f.pickup_datetime AS DATE)
 )
 SELECT
-    podcast_name,
-    event_date,
-    daily_listens,
-    -- Running total: sum of all daily_listens from the beginning up to this date
-    SUM(daily_listens) OVER (
-        PARTITION BY podcast_name
-        ORDER BY event_date
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS running_total_listens
-FROM daily_counts
-ORDER BY podcast_name, event_date;
+    borough,
+    pickup_date,
+    daily_revenue,
+    daily_trips,
+    -- Running total: cumulative revenue from the first day to this day
+    ROUND(
+        SUM(daily_revenue) OVER (
+            PARTITION BY borough
+            ORDER BY pickup_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        2
+    ) AS running_total_revenue
+FROM daily_revenue
+ORDER BY borough, pickup_date;
 
 
 -- =============================================================================
--- Exercise 7b: Rank Users by Listening Time
+-- Exercise 7b: Rank Zones by Trip Volume
 -- =============================================================================
 -- Demonstrates the difference between three ranking functions:
 --   RANK()       - gaps after ties     (1, 2, 2, 4)
 --   DENSE_RANK() - no gaps after ties  (1, 2, 2, 3)
 --   ROW_NUMBER() - always unique       (1, 2, 3, 4)
 --
--- All three produce the same result when there are no ties.
+-- Partitioned by borough so each borough has its own ranking.
 -- =============================================================================
 
-WITH user_listening AS (
+WITH zone_trips AS (
     SELECT
-        u.user_id,
-        u.name,
-        ROUND(SUM(f.listened_seconds) / 3600.0, 2) AS total_hours
-    FROM fact_listens f
-    JOIN dim_users u ON f.user_key = u.user_key
-    GROUP BY u.user_id, u.name
+        z.borough,
+        z.zone,
+        COUNT(*) AS total_trips
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough != 'Unknown'
+    GROUP BY z.borough, z.zone
 )
 SELECT
-    user_id,
-    name,
-    total_hours,
-    -- RANK: 1, 2, 2, 4 (skips rank 3 because two users tied for rank 2)
-    RANK()       OVER (ORDER BY total_hours DESC) AS rank_with_gaps,
-    -- DENSE_RANK: 1, 2, 2, 3 (no gap -- next rank after a tie is consecutive)
-    DENSE_RANK() OVER (ORDER BY total_hours DESC) AS rank_dense,
-    -- ROW_NUMBER: 1, 2, 3, 4 (always unique -- ties broken arbitrarily)
-    ROW_NUMBER() OVER (ORDER BY total_hours DESC) AS row_num
-FROM user_listening
-ORDER BY total_hours DESC
-LIMIT 50;
+    borough,
+    zone,
+    total_trips,
+    -- RANK: 1, 2, 2, 4 (skips rank 3 because two zones tied for rank 2)
+    RANK()       OVER (PARTITION BY borough ORDER BY total_trips DESC) AS rank_with_gaps,
+    -- DENSE_RANK: 1, 2, 2, 3 (no gap after ties)
+    DENSE_RANK() OVER (PARTITION BY borough ORDER BY total_trips DESC) AS rank_dense,
+    -- ROW_NUMBER: 1, 2, 3, 4 (always unique, ties broken arbitrarily)
+    ROW_NUMBER() OVER (PARTITION BY borough ORDER BY total_trips DESC) AS row_num
+FROM zone_trips
+ORDER BY borough, total_trips DESC;
 
 
 -- =============================================================================
--- Exercise 7c: 7-Day Moving Average of Daily Listens
+-- Exercise 7c: 7-Day Moving Average of Trip Distances
 -- =============================================================================
 -- Window: ORDER BY date, with an explicit frame of 6 preceding rows + current
 -- Function: AVG() over a sliding window of 7 days
@@ -91,184 +95,245 @@ LIMIT 50;
 -- also smooths out day-of-week effects (weekday vs weekend patterns).
 -- =============================================================================
 
-WITH daily_totals AS (
+WITH daily_distances AS (
     SELECT
-        event_date,
-        COUNT(*) AS daily_listens
-    FROM fact_listens
-    GROUP BY event_date
+        CAST(pickup_datetime AS DATE) AS trip_date,
+        COUNT(*)                       AS daily_trips,
+        ROUND(AVG(trip_distance), 3)   AS avg_distance,
+        ROUND(SUM(trip_distance), 1)   AS total_distance
+    FROM fact_yellow_trips
+    GROUP BY CAST(pickup_datetime AS DATE)
 )
 SELECT
-    event_date,
-    daily_listens,
-    -- 7-day moving average: average of the current day and the 6 preceding days
+    trip_date,
+    daily_trips,
+    avg_distance,
+    -- 7-day moving average: smooths out day-of-week patterns
     ROUND(
-        AVG(daily_listens) OVER (
-            ORDER BY event_date
+        AVG(avg_distance) OVER (
+            ORDER BY trip_date
             ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
         ),
-        1
-    ) AS moving_avg_7d,
-    -- For comparison: 30-day moving average for longer-term trend
+        3
+    ) AS moving_avg_distance_7d,
+    -- 30-day moving average: reveals longer-term trends
     ROUND(
-        AVG(daily_listens) OVER (
-            ORDER BY event_date
+        AVG(avg_distance) OVER (
+            ORDER BY trip_date
             ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
         ),
-        1
-    ) AS moving_avg_30d
-FROM daily_totals
-ORDER BY event_date;
+        3
+    ) AS moving_avg_distance_30d
+FROM daily_distances
+ORDER BY trip_date;
 
 
 -- =============================================================================
--- Exercise 7d: Month-over-Month Growth Rate
+-- Exercise 7d: Month-over-Month Growth Rate by Borough
 -- =============================================================================
 -- Window function: LAG() to reference the previous month's value
 --
 -- LAG(column, offset, default) looks back `offset` rows in the partition.
--- We use it to calculate growth rate:
---   growth_rate = (current_month - previous_month) / previous_month * 100
+-- Growth rate = (current - previous) / previous * 100
 -- =============================================================================
 
-WITH monthly_hours AS (
+WITH monthly_trips AS (
     SELECT
-        p.name_en AS podcast_name,
-        DATE_TRUNC('month', f.event_date)::DATE AS month,
-        ROUND(SUM(f.listened_seconds) / 3600.0, 1) AS total_hours
-    FROM fact_listens f
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-    GROUP BY p.name_en, DATE_TRUNC('month', f.event_date)
+        z.borough,
+        DATE_TRUNC('month', f.pickup_datetime)::DATE AS month,
+        COUNT(*)                                      AS trip_count,
+        ROUND(SUM(f.total_amount), 2)                 AS total_revenue
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough != 'Unknown'
+    GROUP BY z.borough, DATE_TRUNC('month', f.pickup_datetime)
 )
 SELECT
-    podcast_name,
+    borough,
     month,
-    total_hours,
-    -- Previous month's hours (LAG looks back 1 row within each podcast partition)
-    LAG(total_hours, 1) OVER (
-        PARTITION BY podcast_name
+    trip_count,
+    total_revenue,
+    -- Previous month's trip count
+    LAG(trip_count, 1) OVER (
+        PARTITION BY borough
         ORDER BY month
-    ) AS prev_month_hours,
-    -- Month-over-month growth rate as a percentage
+    ) AS prev_month_trips,
+    -- Month-over-month trip growth as a percentage
     ROUND(
-        (total_hours - LAG(total_hours, 1) OVER (
-            PARTITION BY podcast_name ORDER BY month
-        )) /
-        NULLIF(LAG(total_hours, 1) OVER (
-            PARTITION BY podcast_name ORDER BY month
+        (trip_count - LAG(trip_count, 1) OVER (
+            PARTITION BY borough ORDER BY month
+        ))::DOUBLE /
+        NULLIF(LAG(trip_count, 1) OVER (
+            PARTITION BY borough ORDER BY month
         ), 0) * 100,
         1
-    ) AS mom_growth_pct
-FROM monthly_hours
-ORDER BY podcast_name, month;
+    ) AS mom_trip_growth_pct,
+    -- Month-over-month revenue growth
+    ROUND(
+        (total_revenue - LAG(total_revenue, 1) OVER (
+            PARTITION BY borough ORDER BY month
+        )) /
+        NULLIF(LAG(total_revenue, 1) OVER (
+            PARTITION BY borough ORDER BY month
+        ), 0) * 100,
+        1
+    ) AS mom_revenue_growth_pct
+FROM monthly_trips
+ORDER BY borough, month;
 
 
 -- =============================================================================
--- Exercise 7e: Percentile Distribution of Listen Duration
+-- Exercise 7e: Percent of Total Calculations
 -- =============================================================================
--- Window function: PERCENTILE_CONT() for continuous percentile calculation
+-- Window function: SUM() OVER (PARTITION BY ...) for denominator
 --
--- Percentiles show the distribution shape:
---   - If p50 (median) is much lower than p95, the distribution is right-skewed
---     (most users listen briefly, a few listen very long)
---   - If p25 is close to p75, the distribution is tight (most users behave similarly)
+-- For each zone, calculate:
+--   1. What % of the borough's total trips does this zone represent?
+--   2. What % of the city's total trips does this zone represent?
 -- =============================================================================
 
-SELECT
-    p.category,
-    COUNT(*) AS total_listens,
-    -- 25th percentile: 25% of listens are shorter than this
-    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY f.listened_seconds), 0)
-        AS p25_seconds,
-    -- 50th percentile (median): the "typical" listen duration
-    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY f.listened_seconds), 0)
-        AS p50_median_seconds,
-    -- 75th percentile: 75% of listens are shorter than this
-    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY f.listened_seconds), 0)
-        AS p75_seconds,
-    -- 95th percentile: captures the long-tail listeners
-    ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY f.listened_seconds), 0)
-        AS p95_seconds,
-    -- For context: show the average too (often pulled up by outliers)
-    ROUND(AVG(f.listened_seconds), 0) AS avg_seconds
-FROM fact_listens f
-JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
-GROUP BY p.category
-ORDER BY total_listens DESC;
-
-
--- =============================================================================
--- BONUS: First and Last Listen Per User (FIRST_VALUE / LAST_VALUE)
--- =============================================================================
--- Demonstrates FIRST_VALUE and LAST_VALUE window functions.
--- For each user, find the first and last podcast they ever listened to.
--- =============================================================================
-
-WITH user_listen_order AS (
+WITH zone_trips AS (
     SELECT
-        u.user_id,
-        u.name AS user_name,
-        p.name_en AS podcast_name,
-        f.event_date,
-        f.event_timestamp,
-        -- First podcast this user ever listened to
-        FIRST_VALUE(p.name_en) OVER (
-            PARTITION BY u.user_id
-            ORDER BY f.event_timestamp
-            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-        ) AS first_podcast,
-        -- Most recent podcast this user listened to
-        LAST_VALUE(p.name_en) OVER (
-            PARTITION BY u.user_id
-            ORDER BY f.event_timestamp
-            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-        ) AS last_podcast,
-        -- Row number to pick just one row per user
-        ROW_NUMBER() OVER (PARTITION BY u.user_id ORDER BY f.event_timestamp) AS rn
-    FROM fact_listens f
-    JOIN dim_users u     ON f.user_key = u.user_key
-    JOIN dim_episodes ep ON f.episode_key = ep.episode_key
-    JOIN dim_podcasts p  ON ep.podcast_id = p.podcast_id AND p.is_current = true
+        z.borough,
+        z.zone,
+        COUNT(*) AS trip_count
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough != 'Unknown'
+    GROUP BY z.borough, z.zone
 )
 SELECT
-    user_id,
-    user_name,
-    first_podcast,
-    last_podcast,
-    -- Did the user's first and last podcast differ? (exploration indicator)
-    CASE WHEN first_podcast != last_podcast THEN 'Yes' ELSE 'No' END AS explored_new_shows
-FROM user_listen_order
-WHERE rn = 1
-ORDER BY user_id
-LIMIT 30;
+    borough,
+    zone,
+    trip_count,
+    -- Percentage of borough total
+    ROUND(
+        trip_count::DOUBLE /
+        SUM(trip_count) OVER (PARTITION BY borough) * 100,
+        2
+    ) AS pct_of_borough,
+    -- Percentage of city total
+    ROUND(
+        trip_count::DOUBLE /
+        SUM(trip_count) OVER () * 100,
+        2
+    ) AS pct_of_city,
+    -- Cumulative percentage within borough (for Pareto analysis)
+    ROUND(
+        SUM(trip_count) OVER (
+            PARTITION BY borough
+            ORDER BY trip_count DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )::DOUBLE /
+        SUM(trip_count) OVER (PARTITION BY borough) * 100,
+        2
+    ) AS cumulative_pct_of_borough
+FROM zone_trips
+ORDER BY borough, trip_count DESC;
 
 
 -- =============================================================================
--- BONUS: NTILE -- Segment Users into Listening Quartiles
+-- BONUS: Lead/Lag for Comparing Consecutive Periods
+-- =============================================================================
+-- Compare each day's revenue to the same day last week using LAG(7).
+-- This removes day-of-week seasonality from the comparison.
+-- =============================================================================
+
+WITH daily_revenue AS (
+    SELECT
+        CAST(pickup_datetime AS DATE)    AS trip_date,
+        COUNT(*)                          AS trip_count,
+        ROUND(SUM(total_amount), 2)       AS daily_revenue
+    FROM fact_yellow_trips
+    GROUP BY CAST(pickup_datetime AS DATE)
+)
+SELECT
+    trip_date,
+    trip_count,
+    daily_revenue,
+    -- Same day last week
+    LAG(daily_revenue, 7) OVER (ORDER BY trip_date) AS revenue_last_week,
+    -- Week-over-week change
+    ROUND(
+        (daily_revenue - LAG(daily_revenue, 7) OVER (ORDER BY trip_date)) /
+        NULLIF(LAG(daily_revenue, 7) OVER (ORDER BY trip_date), 0) * 100,
+        1
+    ) AS wow_change_pct,
+    -- Next day's revenue (LEAD looks forward)
+    LEAD(daily_revenue, 1) OVER (ORDER BY trip_date) AS next_day_revenue
+FROM daily_revenue
+ORDER BY trip_date;
+
+
+-- =============================================================================
+-- BONUS: NTILE -- Segment Zones into Trip Volume Quartiles
 -- =============================================================================
 -- NTILE(n) divides ordered rows into n roughly equal buckets.
--- Here we segment users into 4 quartiles based on total listening time.
+-- Here we segment zones into 4 quartiles based on total trip count.
 -- =============================================================================
 
-WITH user_hours AS (
+WITH zone_trips AS (
     SELECT
-        u.user_id,
-        u.name,
-        u.subscription_type,
-        ROUND(SUM(f.listened_seconds) / 3600.0, 2) AS total_hours
-    FROM fact_listens f
-    JOIN dim_users u ON f.user_key = u.user_key
-    GROUP BY u.user_id, u.name, u.subscription_type
+        z.borough,
+        z.zone,
+        COUNT(*) AS total_trips,
+        ROUND(SUM(f.total_amount), 2) AS total_revenue
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough != 'Unknown'
+    GROUP BY z.borough, z.zone
 )
 SELECT
-    -- NTILE(4) assigns each user to a quartile (1=lowest, 4=highest)
-    NTILE(4) OVER (ORDER BY total_hours) AS quartile,
-    COUNT(*) AS user_count,
-    ROUND(MIN(total_hours), 2) AS min_hours,
-    ROUND(AVG(total_hours), 2) AS avg_hours,
-    ROUND(MAX(total_hours), 2) AS max_hours
-FROM user_hours
+    NTILE(4) OVER (ORDER BY total_trips) AS quartile,
+    COUNT(*)                              AS zone_count,
+    MIN(total_trips)                      AS min_trips,
+    ROUND(AVG(total_trips), 0)            AS avg_trips,
+    MAX(total_trips)                      AS max_trips,
+    ROUND(SUM(total_revenue), 0)          AS total_revenue
+FROM zone_trips
 GROUP BY quartile
 ORDER BY quartile;
+
+
+-- =============================================================================
+-- BONUS: FIRST_VALUE / LAST_VALUE -- Busiest and Quietest Hours per Zone
+-- =============================================================================
+
+WITH zone_hourly AS (
+    SELECT
+        z.zone,
+        z.borough,
+        EXTRACT(HOUR FROM f.pickup_datetime)::INTEGER AS hour_of_day,
+        COUNT(*) AS trip_count
+    FROM fact_yellow_trips f
+    JOIN dim_zones z ON f.pickup_location_id = z.location_id AND z.is_current = true
+    WHERE z.borough = 'Manhattan'
+    GROUP BY z.zone, z.borough, hour_of_day
+)
+SELECT DISTINCT
+    zone,
+    -- Busiest hour for this zone
+    FIRST_VALUE(hour_of_day) OVER (
+        PARTITION BY zone
+        ORDER BY trip_count DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS peak_hour,
+    FIRST_VALUE(trip_count) OVER (
+        PARTITION BY zone
+        ORDER BY trip_count DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS peak_hour_trips,
+    -- Quietest hour for this zone
+    LAST_VALUE(hour_of_day) OVER (
+        PARTITION BY zone
+        ORDER BY trip_count DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS quiet_hour,
+    LAST_VALUE(trip_count) OVER (
+        PARTITION BY zone
+        ORDER BY trip_count DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS quiet_hour_trips
+FROM zone_hourly
+ORDER BY peak_hour_trips DESC
+LIMIT 20;

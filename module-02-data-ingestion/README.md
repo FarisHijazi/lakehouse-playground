@@ -6,10 +6,12 @@ Data ingestion is the first step in any data pipeline. It involves moving data f
 source systems into your lakehouse, transforming raw formats into efficient analytical
 formats, and handling real-world data quality issues along the way.
 
-In this module, you will work with a podcast platform's raw data: user profiles with
-messy fields, streaming events with duplicates and late arrivals, CDN logs, and ad
-impression data. By the end, you will have built production-grade ingestion scripts
-that clean, deduplicate, partition, and store data in columnar formats.
+In this module, you will work with real NYC Taxi & Limousine Commission (TLC) trip
+data: yellow taxi trips with messy fields (null passenger counts, negative fares,
+zero-distance trips), green taxi trips with a different schema, for-hire vehicle
+records (Uber/Lyft), and small dimension tables (zones, vendors, payment types).
+By the end, you will have built production-grade ingestion scripts that clean,
+deduplicate, partition, and store data in columnar formats.
 
 ---
 
@@ -58,16 +60,16 @@ at ingest time.
 ### When to Use Which Format
 
 ```
-Source data (CSV, JSON, JSONL)
-    │
-    ▼
-Bronze layer ──► Store as-is, or convert to Parquet for space savings
-    │
-    ▼
-Silver layer ──► Parquet or Delta (cleaned, typed, deduplicated)
-    │
-    ▼
-Gold layer   ──► Delta or Parquet (aggregated, business-ready)
+Source data (Parquet, CSV)
+    |
+    v
+Bronze layer --> Store as-is, or re-partition for access patterns
+    |
+    v
+Silver layer --> Parquet (cleaned, typed, deduplicated)
+    |
+    v
+Gold layer   --> Parquet or Delta (aggregated, business-ready)
 ```
 
 **Rules of thumb:**
@@ -104,18 +106,24 @@ if storage cost is a concern and your tooling supports it.
 
 In this module you will write Python scripts that:
 
-1. **Profile** the raw data to discover quality issues before writing any transforms.
-2. **Convert** raw CSV/JSON to Parquet with explicit schemas and compression.
-3. **Clean** messy user data: parse mixed date formats, normalize gender values, handle nulls.
-4. **Deduplicate** listening events using event IDs and timestamp-based logic.
-5. **Partition** events by date into a Parquet directory structure for efficient querying.
-6. **Benchmark** file formats to see the real-world impact of format choice.
-7. **Implement incremental ingestion** so only new source files are processed.
+1. **Profile** the raw NYC taxi data to discover quality issues before writing any transforms.
+2. **Convert** taxi trip Parquet files to CSV and JSON to demonstrate format tradeoffs.
+3. **Clean** messy trip data: handle null passenger counts, negative fares, impossible distances, bad rate codes.
+4. **Deduplicate** taxi trips using composite keys (the real TLC data has actual duplicates).
+5. **Partition** yellow taxi trips by pickup date and borough (using zone lookup joins).
+6. **Benchmark** file formats to see the real-world impact of format choice on taxi-scale data.
+7. **Implement incremental ingestion** so only new monthly Parquet files are processed.
 
 ## Prerequisites
 
 ```bash
-pip install pandas pyarrow fastparquet
+pip install pandas pyarrow
+```
+
+Also run the data downloader to fetch real TLC data:
+
+```bash
+python scripts/download_data.py
 ```
 
 ## Directory Structure
@@ -127,9 +135,9 @@ module-02-data-ingestion/
 └── solutions/
     ├── profile_data.py        # Exercise 1: Data profiling
     ├── convert_formats.py     # Exercise 2: Format conversion
-    ├── clean_users.py         # Exercise 3: User data cleaning
-    ├── deduplicate_events.py  # Exercise 4: Event deduplication
-    ├── partition_events.py    # Exercise 5: Date partitioning
+    ├── clean_trips.py         # Exercise 3: Trip data cleaning
+    ├── deduplicate_events.py  # Exercise 4: Trip deduplication
+    ├── partition_events.py    # Exercise 5: Date + borough partitioning
     ├── compare_formats.py     # Exercise 6: Format benchmarks
     └── incremental_ingest.py  # Exercise 7: Incremental ingestion
 ```

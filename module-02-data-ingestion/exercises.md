@@ -12,7 +12,7 @@ Write a script (`profile_data.py`) that reads every raw data source and prints a
 report covering:
 
 - Row counts and column names
-- Data types (as inferred by pandas)
+- Data types (as inferred by pandas or embedded in Parquet)
 - Null counts and null percentages per column
 - Unique value counts for categorical columns
 - Sample values for each column
@@ -20,149 +20,154 @@ report covering:
 - Duplicate detection (full-row and key-based)
 
 **Data sources to profile:**
-- `data/raw/users.csv` (5,000 users)
-- `data/raw/podcasts.json` (10 podcasts)
-- `data/raw/episodes.json` (784 episodes)
-- `data/raw/listening_events/events_*.jsonl` (~200k+ events across ~2,500 daily files)
-- `data/raw/cdn_logs.csv` (50,000 CDN log entries)
-- `data/raw/ad_events.json` (18,071 ad events)
+- `data/raw/yellow_tripdata_2023-01.parquet` (and any other yellow months)
+- `data/raw/green_tripdata_2023-01.parquet` (if downloaded)
+- `data/raw/fhvhv_tripdata_2023-01.parquet` (if downloaded)
+- `data/raw/taxi_zone_lookup.csv` (265 zones)
+- `data/raw/vendors.csv`, `rate_codes.csv`, `payment_types.csv`
+- `data/raw/nyc_weather_2023.csv` (365 days)
 
 **Questions to answer:**
-1. How many distinct date formats appear in `users.csv.signup_date`?
-2. What are all the gender values in `users.csv`? How would you normalize them?
-3. How many duplicate `event_id` values exist across listening events?
-4. What percentage of user records have null `city` values?
-5. What is the date range of listening events?
+1. What percentage of yellow taxi trips have null `passenger_count`?
+2. How many trips have negative `fare_amount`? What do they look like?
+3. How many trips have `trip_distance = 0` but `fare_amount > 0`?
+4. What are all the `rate_code_id` values? Does 99 (unknown) appear?
+5. What is the date range of trips? Are there any trips outside the expected month?
 
-**Hint**: Use `pd.read_json(..., lines=True)` for JSONL files. To read all JSONL files,
-use `glob.glob()` and `pd.concat()`.
+**Hint**: Use `pd.read_parquet()` for Parquet files. For very large files, read
+only a sample or specific columns with the `columns` parameter.
 
 ---
 
-## Exercise 2: Convert CSV/JSON to Parquet
+## Exercise 2: Convert Parquet to CSV/JSON (Format Tradeoffs)
 
-**Goal**: Convert raw files to Parquet with explicit schemas and compression.
+**Goal**: Convert taxi trip Parquet to CSV and JSON to understand format tradeoffs.
 
 Write a script (`convert_formats.py`) that:
 
-1. Reads each raw data source.
-2. Defines an explicit PyArrow schema for each dataset (do not rely on pandas inference).
-3. Writes Parquet files with Snappy compression to `data/processed/bronze/`.
-4. Prints the original file size vs Parquet file size for each dataset.
+1. Reads a yellow taxi Parquet file.
+2. Writes the same data as CSV, JSON (line-delimited), and Parquet with different
+   compression (Snappy, Gzip, Zstd, uncompressed).
+3. Also converts the CSV dimension files (zones, vendors, etc.) to Parquet.
+4. Prints the original file size vs each output format size.
 
 **Key concepts to practice:**
 - Defining PyArrow schemas with `pa.schema([pa.field(...), ...])`
 - Choosing appropriate types: `pa.string()`, `pa.int32()`, `pa.float64()`, `pa.timestamp()`
 - Setting compression: `pq.write_table(..., compression='snappy')`
+- Understanding why taxi data ships as Parquet (not CSV) from the TLC
 
 **Expected output structure:**
 ```
 data/processed/bronze/
-├── podcasts.parquet
-├── episodes.parquet
-├── users.parquet
-├── listening_events.parquet
-├── cdn_logs.parquet
-└── ad_events.parquet
+├── yellow_tripdata_2023-01.parquet   (re-written with explicit schema)
+├── taxi_zones.parquet
+├── vendors.parquet
+├── rate_codes.parquet
+├── payment_types.parquet
+└── nyc_weather.parquet
 ```
 
 ---
 
-## Exercise 3: Clean the Messy User Data
+## Exercise 3: Clean the Messy Trip Data
 
-**Goal**: Handle real-world data quality issues in `users.csv`.
+**Goal**: Handle real-world data quality issues in the yellow taxi trips.
 
-Write a script (`clean_users.py`) that:
+Write a script (`clean_trips.py`) that:
 
-1. **Parses mixed date formats** in `signup_date`:
-   - ISO format: `2024-09-10`
-   - ISO with time: `2022-09-21T00:00:00`
-   - Day/Month/Year: `23/09/2022`
-   - Month-Day-Year: `03-09-2019`, `07-21-2021`
-   - Use `pd.to_datetime(..., format='mixed', dayfirst=False)` or write a custom parser.
+1. **Handles null values**:
+   - `passenger_count`: fill nulls with 1 (single rider assumption).
+   - `rate_code_id`: replace 99 and nulls with 1 (standard rate).
+   - `store_and_fwd_flag`: fill nulls with `'N'`.
+   - `congestion_surcharge`, `airport_fee`: fill nulls with 0.0.
 
-2. **Normalizes gender values** to a standard set (`male`, `female`, `unknown`):
-   - Input values include: `m`, `M`, `male`, `Male`, `f`, `F`, `female`, `Female`, `""` (empty)
-   - Map all variations to `male`, `female`, or `unknown`.
+2. **Removes bad records**:
+   - Negative `fare_amount` (unless very small, these are errors).
+   - `trip_distance < 0` (impossible).
+   - `passenger_count > 9` (taxi max is ~6, be generous).
+   - Trips where `tpep_dropoff_datetime < tpep_pickup_datetime` (time travel).
 
-3. **Handles null values**:
-   - Fill missing `city` with `"Unknown"`.
-   - Fill missing `age` with the median age.
-   - Fill missing `gender` with `"unknown"`.
-   - Fill missing `email` with a placeholder.
+3. **Caps outliers**:
+   - `trip_distance > 200` miles (NYC is 35 miles long).
+   - `fare_amount > 1000` (even JFK trips rarely exceed $100).
+   - `tip_amount > 500`.
 
-4. **Detects and removes full duplicates** (users appearing more than once).
+4. **Adds derived columns**:
+   - `trip_duration_min`: dropoff minus pickup in minutes.
+   - `pickup_date`: date extracted from pickup datetime.
 
-5. Writes the cleaned data to `data/processed/silver/users_clean.parquet`.
+5. Writes the cleaned data to `data/processed/silver/yellow_trips_clean.parquet`.
 
 **Validation**: After cleaning, assert:
-- No null values in `signup_date`, `gender`, `city`.
-- All gender values are in `{'male', 'female', 'unknown'}`.
-- No duplicate `user_id` values.
+- No null values in `passenger_count`, `rate_code_id`.
+- No negative `fare_amount` values.
+- No trips with dropoff before pickup.
 
 ---
 
-## Exercise 4: Deduplicate Listening Events
+## Exercise 4: Deduplicate Taxi Trips
 
-**Goal**: Remove duplicate events from the listening event stream.
+**Goal**: Remove duplicate trips from the yellow taxi data.
 
 Write a script (`deduplicate_events.py`) that:
 
-1. Reads all JSONL files from `data/raw/listening_events/`.
-2. Identifies duplicates by `event_id` (exact duplicates from retries).
-3. For duplicate `event_id` values, keeps the record with the latest timestamp
-   (the most recent version is most likely to be correct).
-4. Reports how many duplicates were found and removed.
-5. Writes deduplicated data to `data/processed/silver/listening_events_deduped.parquet`.
+1. Reads yellow taxi trip data (raw Parquet).
+2. Identifies exact row duplicates (the TLC data genuinely has them).
+3. Identifies semantic duplicates using a composite key:
+   `(vendor_id, tpep_pickup_datetime, tpep_dropoff_datetime, pu_location_id,
+   do_location_id, trip_distance, fare_amount)`.
+4. Reports how many duplicates were found at each level.
+5. Writes deduplicated data to `data/processed/silver/yellow_trips_deduped.parquet`.
 
 **Think about:**
-- Why do duplicates happen in event streams? (at-least-once delivery, retries, client bugs)
+- Why do duplicates happen in taxi data? (system resubmissions, meter resets, vendor bugs)
 - What is the difference between exact duplicates and semantic duplicates?
-- When would you deduplicate on a composite key (user_id + episode_id + timestamp)
-  instead of event_id?
+- Why use a composite key instead of a single ID? (TLC data has no unique trip ID)
 
 ---
 
-## Exercise 5: Partition Listening Events by Date
+## Exercise 5: Partition Taxi Trips by Date and Borough
 
-**Goal**: Organize events into a partitioned directory structure for efficient querying.
+**Goal**: Organize trips into a partitioned directory structure for efficient querying.
 
 Write a script (`partition_events.py`) that:
 
-1. Reads the deduplicated events from Exercise 4 (or raw events if not done yet).
-2. Extracts the date from the timestamp column.
-3. Writes Parquet files partitioned by `year` and `month`:
+1. Reads yellow taxi trip data (cleaned or raw).
+2. Joins with `taxi_zone_lookup.csv` to get the pickup borough name.
+3. Extracts year and month from `tpep_pickup_datetime`.
+4. Writes Parquet files partitioned by `pickup_borough` and `pickup_month`:
    ```
-   data/processed/silver/listening_events_partitioned/
-   ├── year=2018/
-   │   ├── month=01/
+   data/processed/silver/yellow_trips_partitioned/
+   ├── pickup_borough=Manhattan/
+   │   ├── pickup_month=2023-01/
    │   │   └── data.parquet
-   │   ├── month=02/
+   │   ├── pickup_month=2023-02/
    │   │   └── data.parquet
    │   └── ...
-   ├── year=2019/
+   ├── pickup_borough=Brooklyn/
    │   └── ...
    └── ...
    ```
-4. Reports the number of records per partition.
+5. Reports the number of records per partition.
 
 **Key concepts:**
 - Partitioning reduces I/O by allowing query engines to skip irrelevant files.
-- Over-partitioning (too many small files) hurts performance. Partition by coarse
-  granularity (year/month) rather than fine (year/month/day) for this dataset size.
+- Borough-level partitioning is ideal for NYC taxi data (5 boroughs + EWR + Unknown).
 - PyArrow's `pq.write_to_dataset()` handles partitioning automatically.
+- Joining with dimension tables during ingestion is a common enrichment pattern.
 
 ---
 
 ## Exercise 6: Compare File Sizes and Read Performance
 
-**Goal**: See the real-world impact of file format and compression choices.
+**Goal**: See the real-world impact of file format and compression choices on taxi data.
 
-Write a script (`compare_formats.py`) that takes the listening events data and:
+Write a script (`compare_formats.py`) that takes a yellow taxi Parquet file and:
 
 1. Writes it in multiple formats:
    - CSV (uncompressed)
-   - JSON
+   - JSON (line-delimited)
    - Parquet with Snappy compression
    - Parquet with Gzip compression
    - Parquet with Zstd compression
@@ -181,18 +186,18 @@ significantly faster to read for analytical queries due to column pruning.
 
 ## Exercise 7: Incremental Ingestion
 
-**Goal**: Build a pipeline that only processes new files, avoiding reprocessing.
+**Goal**: Build a pipeline that only processes new monthly taxi files, avoiding reprocessing.
 
 Write a script (`incremental_ingest.py`) that:
 
-1. Maintains a checkpoint file (`data/processed/checkpoints/listening_events_checkpoint.json`)
-   tracking which source files have already been processed.
+1. Maintains a checkpoint file (`data/processed/checkpoints/taxi_ingest_checkpoint.json`)
+   tracking which source Parquet files have already been processed.
 2. On each run:
-   - Scans `data/raw/listening_events/` for all JSONL files.
+   - Scans `data/raw/` for all `yellow_tripdata_*.parquet` files.
    - Compares against the checkpoint to find new (unprocessed) files.
    - Reads only the new files.
-   - Deduplicates the new events (within the batch and against previously processed event IDs).
-   - Appends the new events to the partitioned output.
+   - Applies basic cleaning (from Exercise 3).
+   - Appends the cleaned data to the output directory.
    - Updates the checkpoint.
 3. On the first run, processes everything. On subsequent runs, processes nothing
    (since all files are already tracked).
