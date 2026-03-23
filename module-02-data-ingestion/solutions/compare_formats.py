@@ -11,6 +11,9 @@ This script writes the same data in multiple formats and measures:
 The goal is to build intuition for why Parquet is the default choice for
 analytics and when you might choose a different format or compression.
 
+We use real NYC yellow taxi trip data so the compression ratios and read
+patterns reflect production workloads.
+
 Expected insights:
 - Parquet is 5-10x smaller than CSV due to columnar compression.
 - Parquet reads are faster for analytical queries because of column pruning
@@ -46,20 +49,23 @@ BENCHMARK_DIR = PROJECT_ROOT / "data" / "processed" / "benchmarks"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 
 
-def load_events() -> pd.DataFrame:
-    """Load listening events for benchmarking."""
-    deduped_path = SILVER_DIR / "listening_events_deduped.parquet"
-    if deduped_path.exists():
-        log.info("Loading from deduplicated Parquet ...")
-        return pd.read_parquet(deduped_path)
-
-    log.info("Deduplicated file not found, loading from raw JSONL ...")
+def load_trips() -> pd.DataFrame:
+    """Load yellow taxi trip data for benchmarking."""
     from glob import glob
-    events_dir = RAW_DIR / "listening_events"
-    jsonl_files = sorted(glob(str(events_dir / "events_*.jsonl")))
-    frames = [pd.read_json(f, lines=True) for f in jsonl_files]
+
+    # Try cleaned Silver data first
+    silver_path = SILVER_DIR / "yellow_taxi_trips_cleaned.parquet"
+    if silver_path.exists():
+        log.info("Loading from cleaned Silver Parquet ...")
+        return pd.read_parquet(silver_path)
+
+    # Fall back to raw Parquet files
+    log.info("Cleaned file not found, loading from raw Parquet ...")
+    yellow_files = sorted(glob(str(RAW_DIR / "yellow_tripdata_*.parquet")))
+    if not yellow_files:
+        raise FileNotFoundError(f"No yellow taxi Parquet files found in {RAW_DIR}")
+    frames = [pd.read_parquet(f) for f in yellow_files]
     df = pd.concat(frames, ignore_index=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     return df
 
 
@@ -87,58 +93,59 @@ def file_size_mb(path: Path) -> float:
 def main() -> None:
     BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
 
-    df = load_events()
+    df = load_trips()
     log.info("Loaded %d rows for benchmarking", len(df))
 
-    # Ensure timestamp is string for CSV/JSON (they don't handle datetime natively)
+    # Ensure timestamps are strings for CSV/JSON (they don't handle datetime natively)
     df_for_text = df.copy()
-    if pd.api.types.is_datetime64_any_dtype(df_for_text["timestamp"]):
-        df_for_text["timestamp"] = df_for_text["timestamp"].astype(str)
+    for col in df_for_text.select_dtypes(include=["datetime64", "datetimetz"]).columns:
+        df_for_text[col] = df_for_text[col].astype(str)
 
     # ---- Define formats to test --------------------------------------------
     # Each entry: (label, file_extension, write_function, read_function, filtered_read_function)
+    # Filtered read: select only fare_amount where payment_type == 1 (credit card)
     formats = [
         (
             "CSV (uncompressed)",
             "csv",
             lambda d, p: d.to_csv(p, index=False),
             lambda p: pd.read_csv(p),
-            lambda p: pd.read_csv(p, usecols=["event_type"]).query("event_type == 'complete'"),
+            lambda p: pd.read_csv(p, usecols=["payment_type", "fare_amount"]).query("payment_type == 1"),
         ),
         (
             "JSON",
             "json",
             lambda d, p: d.to_json(p, orient="records", lines=True),
             lambda p: pd.read_json(p, lines=True),
-            lambda p: pd.read_json(p, lines=True)[["event_type"]].query("event_type == 'complete'"),
+            lambda p: pd.read_json(p, lines=True)[["payment_type", "fare_amount"]].query("payment_type == 1"),
         ),
         (
             "Parquet (no compression)",
             "none.parquet",
             lambda d, p: d.to_parquet(p, compression=None, index=False),
             lambda p: pd.read_parquet(p),
-            lambda p: pd.read_parquet(p, columns=["event_type"]).query("event_type == 'complete'"),
+            lambda p: pd.read_parquet(p, columns=["payment_type", "fare_amount"]).query("payment_type == 1"),
         ),
         (
             "Parquet (Snappy)",
             "snappy.parquet",
             lambda d, p: d.to_parquet(p, compression="snappy", index=False),
             lambda p: pd.read_parquet(p),
-            lambda p: pd.read_parquet(p, columns=["event_type"]).query("event_type == 'complete'"),
+            lambda p: pd.read_parquet(p, columns=["payment_type", "fare_amount"]).query("payment_type == 1"),
         ),
         (
             "Parquet (Gzip)",
             "gzip.parquet",
             lambda d, p: d.to_parquet(p, compression="gzip", index=False),
             lambda p: pd.read_parquet(p),
-            lambda p: pd.read_parquet(p, columns=["event_type"]).query("event_type == 'complete'"),
+            lambda p: pd.read_parquet(p, columns=["payment_type", "fare_amount"]).query("payment_type == 1"),
         ),
         (
             "Parquet (Zstd)",
             "zstd.parquet",
             lambda d, p: d.to_parquet(p, compression="zstd", index=False),
             lambda p: pd.read_parquet(p),
-            lambda p: pd.read_parquet(p, columns=["event_type"]).query("event_type == 'complete'"),
+            lambda p: pd.read_parquet(p, columns=["payment_type", "fare_amount"]).query("payment_type == 1"),
         ),
     ]
 
@@ -146,7 +153,7 @@ def main() -> None:
     results = []
 
     for label, ext, write_fn, read_fn, filtered_read_fn in formats:
-        path = BENCHMARK_DIR / f"events_benchmark.{ext}"
+        path = BENCHMARK_DIR / f"trips_benchmark.{ext}"
         log.info("Benchmarking: %s", label)
 
         # Use text-safe DataFrame for CSV and JSON
