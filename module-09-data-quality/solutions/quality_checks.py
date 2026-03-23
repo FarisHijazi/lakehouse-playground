@@ -164,44 +164,64 @@ class QualityChecker:
 
 
 def main():
-    # ---- Users ----
-    users = pd.read_csv(RAW_DIR / "users.csv")
-    uc = QualityChecker(users, "users.csv")
-    uc.check_completeness("user_id")
-    uc.check_completeness("email")
-    uc.check_completeness("name")
-    uc.check_completeness("age", max_null_pct=5.0)
-    uc.check_completeness("gender", max_null_pct=5.0)
-    uc.check_uniqueness("user_id")
-    uc.check_uniqueness("email")
-    uc.check_pattern("email", r".+@.+\..+", description="valid email format")
-    uc.check_pattern("user_id", r"^usr_\d{6}$", description="user_id format usr_NNNNNN")
-    uc.check_range("age", min_val=13, max_val=120)
-    uc.check_accepted_values("gender",
-                             ["m", "f", "M", "F", "male", "female", "Male", "Female"])
-    uc.check_accepted_values("subscription_type",
-                             ["free", "premium", "premium_annual", "trial"])
-    uc.check_accepted_values("platform",
-                             ["ios", "android", "web", "car_play", "smart_speaker"])
-    uc.check_pattern("signup_date", r"^\d{4}-\d{2}-\d{2}$",
-                     description="ISO date format YYYY-MM-DD")
-    uc.summary()
+    # ---- Yellow Tripdata ----
+    yellow_frames = []
+    for f in sorted(RAW_DIR.glob("yellow_tripdata_*.parquet")):
+        yellow_frames.append(pd.read_parquet(f))
+    yellow = pd.concat(yellow_frames, ignore_index=True) if yellow_frames else pd.DataFrame()
 
-    # ---- CDN Logs ----
-    cdn = pd.read_csv(RAW_DIR / "cdn_logs.csv")
-    cc = QualityChecker(cdn, "cdn_logs.csv")
-    cc.check_completeness("log_id")
-    cc.check_completeness("event_id")
-    cc.check_completeness("user_id")
-    cc.check_completeness("timestamp")
-    cc.check_uniqueness("log_id")
-    cc.check_range("startup_time_ms", min_val=0)
-    cc.check_range("bytes_transferred", min_val=1)
-    cc.check_range("buffer_events", min_val=0)
-    cc.check_range("rebuffer_ratio", min_val=0.0, max_val=1.0)
-    cc.check_accepted_values("bitrate",
-                             ["64kbps", "128kbps", "256kbps", "320kbps"])
-    cc.summary()
+    yc = QualityChecker(yellow, "yellow_tripdata")
+    yc.check_completeness("tpep_pickup_datetime")
+    yc.check_completeness("tpep_dropoff_datetime")
+    yc.check_completeness("PULocationID")
+    yc.check_completeness("DOLocationID")
+    yc.check_completeness("fare_amount")
+    yc.check_completeness("passenger_count", max_null_pct=5.0)
+    yc.check_range("fare_amount", min_val=-50, max_val=5000)
+    yc.check_range("trip_distance", min_val=0, max_val=500)
+    yc.check_range("passenger_count", min_val=0, max_val=9)
+    yc.check_range("total_amount", min_val=-100, max_val=10000)
+    yc.check_range("tip_amount", min_val=0, max_val=1000)
+    yc.check_range("PULocationID", min_val=1, max_val=265)
+    yc.check_range("DOLocationID", min_val=1, max_val=265)
+    yc.check_accepted_values("payment_type", [1, 2, 3, 4, 5, 6])
+    yc.check_accepted_values("RatecodeID", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 99.0])
+    yc.check_accepted_values("store_and_fwd_flag", ["Y", "N"])
+    yc.summary()
+
+    # ---- Taxi Zone Lookup ----
+    zones = pd.read_csv(RAW_DIR / "taxi_zone_lookup.csv")
+    zc = QualityChecker(zones, "taxi_zone_lookup")
+    zc.check_completeness("LocationID")
+    zc.check_completeness("Borough")
+    zc.check_completeness("Zone")
+    zc.check_completeness("service_zone")
+    zc.check_uniqueness("LocationID")
+    zc.check_range("LocationID", min_val=1, max_val=265)
+    zc.check_accepted_values("Borough",
+                             ["Manhattan", "Bronx", "Brooklyn", "Queens",
+                              "Staten Island", "EWR", "Unknown"])
+    zc.summary()
+
+    # ---- Green Tripdata ----
+    green_frames = []
+    for f in sorted(RAW_DIR.glob("green_tripdata_*.parquet")):
+        green_frames.append(pd.read_parquet(f))
+    if green_frames:
+        green = pd.concat(green_frames, ignore_index=True)
+        gc = QualityChecker(green, "green_tripdata")
+        gc.check_completeness("lpep_pickup_datetime")
+        gc.check_completeness("lpep_dropoff_datetime")
+        gc.check_completeness("PULocationID")
+        gc.check_completeness("DOLocationID")
+        gc.check_completeness("passenger_count", max_null_pct=5.0)
+        gc.check_range("fare_amount", min_val=-50, max_val=5000)
+        gc.check_range("trip_distance", min_val=0, max_val=500)
+        gc.check_range("passenger_count", min_val=0, max_val=9)
+        gc.check_range("PULocationID", min_val=1, max_val=265)
+        gc.check_range("DOLocationID", min_val=1, max_val=265)
+        gc.check_accepted_values("payment_type", [1, 2, 3, 4, 5, 6])
+        gc.summary()
 
     print("\n  All quality checks complete.")
 

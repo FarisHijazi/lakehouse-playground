@@ -2,8 +2,9 @@
 """
 Module 10 -- Exercise 2: Executive Summary Dashboard
 =====================================================
-A single-page dashboard giving leadership a quick overview of podcast
-platform health: KPI cards, DAU trend, platform breakdown, and category mix.
+A single-page dashboard giving leadership a quick overview of NYC taxi
+fleet performance: KPI cards, daily trip trend, borough breakdown, and
+payment type mix.
 
 Outputs: ../output/executive_dashboard.html
 """
@@ -26,81 +27,76 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 con = duckdb.connect()
 
-events = con.execute(f"""
+trips = con.execute(f"""
     SELECT *
-    FROM read_json_auto('{DATA_DIR}/listening_events/*.jsonl')
+    FROM read_parquet('{DATA_DIR}/yellow_tripdata_*.parquet')
 """).df()
 
-episodes = con.execute(f"""
-    SELECT * FROM read_json_auto('{DATA_DIR}/episodes.json')
+zones = con.execute(f"""
+    SELECT * FROM read_csv_auto('{DATA_DIR}/taxi_zone_lookup.csv')
 """).df()
 
-podcasts = con.execute(f"""
-    SELECT * FROM read_json_auto('{DATA_DIR}/podcasts.json')
-""").df()
-
-ad_events = con.execute(f"""
-    SELECT * FROM read_json_auto('{DATA_DIR}/ad_events.json')
+payment_types = con.execute(f"""
+    SELECT * FROM read_csv_auto('{DATA_DIR}/payment_types.csv')
 """).df()
 
 # Register as tables for convenient SQL
-con.register("events", events)
-con.register("episodes", episodes)
-con.register("podcasts", podcasts)
-con.register("ad_events", ad_events)
+con.register("trips", trips)
+con.register("zones", zones)
+con.register("payment_types", payment_types)
 
 # ---------------------------------------------------------------------------
 # KPI computations
 # ---------------------------------------------------------------------------
-total_listeners = con.execute(
-    "SELECT COUNT(DISTINCT user_id) AS n FROM events"
+total_trips = con.execute(
+    "SELECT COUNT(*) AS n FROM trips"
 ).fetchone()[0]
 
-avg_listen_min = con.execute(
-    "SELECT ROUND(AVG(listened_seconds) / 60.0, 1) FROM events"
+avg_fare = con.execute(
+    "SELECT ROUND(AVG(fare_amount), 2) FROM trips WHERE fare_amount > 0"
 ).fetchone()[0]
 
-completion_rate = con.execute("""
-    SELECT ROUND(
-        COUNT(*) FILTER (WHERE event_type = 'complete') * 100.0 /
-        NULLIF(COUNT(*) FILTER (WHERE event_type IN ('play','resume','complete')), 0),
-    1) FROM events
-""").fetchone()[0]
+avg_distance = con.execute(
+    "SELECT ROUND(AVG(trip_distance), 2) FROM trips WHERE trip_distance > 0"
+).fetchone()[0]
 
-total_ad_revenue = con.execute(
-    "SELECT ROUND(SUM(revenue_sar), 2) FROM ad_events"
+total_revenue = con.execute(
+    "SELECT ROUND(SUM(total_amount), 2) FROM trips"
 ).fetchone()[0]
 
 # ---------------------------------------------------------------------------
-# DAU over time
+# Daily trips over time
 # ---------------------------------------------------------------------------
-dau_df = con.execute("""
+daily_trips_df = con.execute("""
     SELECT
-        CAST(timestamp AS DATE) AS event_date,
-        COUNT(DISTINCT user_id) AS dau
-    FROM events
+        CAST(tpep_pickup_datetime AS DATE) AS trip_date,
+        COUNT(*) AS num_trips
+    FROM trips
     GROUP BY 1
     ORDER BY 1
 """).df()
 
 # ---------------------------------------------------------------------------
-# Listens by platform
+# Trips by borough (pickup)
 # ---------------------------------------------------------------------------
-platform_df = con.execute("""
-    SELECT platform, COUNT(*) AS listens
-    FROM events
+borough_df = con.execute("""
+    SELECT z.Borough AS borough, COUNT(*) AS num_trips
+    FROM trips t
+    JOIN zones z ON t.PULocationID = z.LocationID
+    WHERE z.Borough IS NOT NULL AND z.Borough != 'Unknown'
     GROUP BY 1
     ORDER BY 2 DESC
 """).df()
 
 # ---------------------------------------------------------------------------
-# Listens by podcast category
+# Trips by payment type
 # ---------------------------------------------------------------------------
-category_df = con.execute("""
-    SELECT p.category, COUNT(*) AS listens
-    FROM events e
-    JOIN episodes ep ON e.episode_id = ep.episode_id
-    JOIN podcasts p  ON ep.podcast_id = p.podcast_id
+payment_df = con.execute("""
+    SELECT
+        COALESCE(pt.description, 'Unknown') AS payment_method,
+        COUNT(*) AS num_trips
+    FROM trips t
+    LEFT JOIN payment_types pt ON t.payment_type = pt.payment_type
     GROUP BY 1
     ORDER BY 2 DESC
 """).df()
@@ -116,7 +112,7 @@ fig = make_subplots(
         [{"type": "xy", "colspan": 2}, None],
         [{"type": "xy"}, {"type": "domain"}],
     ],
-    subplot_titles=("", "", "Daily Active Users", "", "Listens by Platform", "Listens by Category"),
+    subplot_titles=("", "", "Daily Trip Count", "", "Trips by Borough", "Trips by Payment Type"),
     vertical_spacing=0.10,
     horizontal_spacing=0.10,
 )
@@ -124,48 +120,48 @@ fig = make_subplots(
 # KPI cards (row 1)
 fig.add_trace(go.Indicator(
     mode="number",
-    value=total_listeners,
-    title={"text": "Total Unique Listeners"},
+    value=total_trips,
+    title={"text": "Total Trips"},
     number={"font": {"size": 40}},
 ), row=1, col=1)
 
 fig.add_trace(go.Indicator(
     mode="number",
-    value=avg_listen_min,
-    title={"text": "Avg Listen (min)"},
-    number={"font": {"size": 40}, "suffix": " min"},
+    value=avg_fare,
+    title={"text": "Avg Fare ($)"},
+    number={"font": {"size": 40}, "prefix": "$"},
 ), row=1, col=2)
 
-# DAU trend (row 2)
+# Daily trip trend (row 2)
 fig.add_trace(go.Scatter(
-    x=dau_df["event_date"],
-    y=dau_df["dau"],
+    x=daily_trips_df["trip_date"],
+    y=daily_trips_df["num_trips"],
     mode="lines",
     fill="tozeroy",
     line={"color": "#636EFA", "width": 2},
-    name="DAU",
+    name="Daily Trips",
 ), row=2, col=1)
 
-# Platform bar chart (row 3, col 1)
+# Borough bar chart (row 3, col 1)
 fig.add_trace(go.Bar(
-    x=platform_df["platform"],
-    y=platform_df["listens"],
+    x=borough_df["borough"],
+    y=borough_df["num_trips"],
     marker_color="#EF553B",
-    name="Platform",
+    name="Borough",
     showlegend=False,
 ), row=3, col=1)
 
-# Category pie chart (row 3, col 2)
+# Payment type pie chart (row 3, col 2)
 fig.add_trace(go.Pie(
-    labels=category_df["category"],
-    values=category_df["listens"],
+    labels=payment_df["payment_method"],
+    values=payment_df["num_trips"],
     hole=0.4,
-    name="Category",
+    name="Payment Type",
 ), row=3, col=2)
 
 fig.update_layout(
     title={
-        "text": "Podcast Platform -- Executive Dashboard",
+        "text": "NYC Taxi -- Executive Dashboard",
         "font": {"size": 24},
         "x": 0.5,
     },
@@ -177,7 +173,7 @@ fig.update_layout(
 
 # Add extra KPI annotations
 fig.add_annotation(
-    text=f"<b>Completion Rate</b><br>{completion_rate}%",
+    text=f"<b>Avg Distance</b><br>{avg_distance} mi",
     xref="paper", yref="paper",
     x=0.62, y=0.95,
     showarrow=False,
@@ -185,7 +181,7 @@ fig.add_annotation(
     align="center",
 )
 fig.add_annotation(
-    text=f"<b>Ad Revenue</b><br>{total_ad_revenue:,.0f} SAR",
+    text=f"<b>Total Revenue</b><br>${total_revenue:,.0f}",
     xref="paper", yref="paper",
     x=0.88, y=0.95,
     showarrow=False,
@@ -202,19 +198,19 @@ fig.write_html(str(output_path), include_plotlyjs="cdn")
 print("=" * 60)
 print("  EXECUTIVE DASHBOARD -- Summary Statistics")
 print("=" * 60)
-print(f"  Total Unique Listeners : {total_listeners:,}")
-print(f"  Avg Listen Duration    : {avg_listen_min} min")
-print(f"  Completion Rate        : {completion_rate}%")
-print(f"  Total Ad Revenue       : {total_ad_revenue:,.2f} SAR")
-print(f"  DAU Range              : {dau_df['dau'].min()} - {dau_df['dau'].max()}")
-print(f"  Days of Data           : {len(dau_df)}")
+print(f"  Total Trips            : {total_trips:,}")
+print(f"  Avg Fare               : ${avg_fare}")
+print(f"  Avg Trip Distance      : {avg_distance} mi")
+print(f"  Total Revenue          : ${total_revenue:,.2f}")
+print(f"  Daily Trip Range       : {daily_trips_df['num_trips'].min():,} - {daily_trips_df['num_trips'].max():,}")
+print(f"  Days of Data           : {len(daily_trips_df)}")
 print("-" * 60)
-print("  Top Platforms:")
-for _, row in platform_df.iterrows():
-    print(f"    {str(row['platform']):20s} {int(row['listens']):>8,} listens")
+print("  Trips by Borough:")
+for _, row in borough_df.iterrows():
+    print(f"    {str(row['borough']):20s} {int(row['num_trips']):>10,} trips")
 print("-" * 60)
-print("  Category Mix:")
-for _, row in category_df.iterrows():
-    print(f"    {str(row['category']):20s} {int(row['listens']):>8,} listens")
+print("  Payment Type Mix:")
+for _, row in payment_df.iterrows():
+    print(f"    {str(row['payment_method']):20s} {int(row['num_trips']):>10,} trips")
 print("=" * 60)
 print(f"\n  Dashboard saved to: {output_path}")

@@ -4,13 +4,13 @@ Work through these exercises in order. Each one builds on concepts from the prev
 All solutions use pandas and DuckDB. Run them from the repository root:
 
 ```bash
-pip install pandas duckdb pyyaml
+pip install pandas duckdb pyyaml pyarrow
 python module-09-data-quality/solutions/<script>.py
 ```
 
-The raw data at `data/raw/` has intentional quality issues: mixed date formats, nulls,
-duplicates, late-arriving events, inconsistent gender values, negative CDN values,
-bot-like behavior, and more. Your job is to find them.
+The raw data at `data/raw/` includes NYC TLC taxi trip parquet files and reference CSV
+files. Real taxi data has real quality issues: null passenger counts, zero-distance trips,
+negative fares, impossible location IDs, and more. Your job is to find them.
 
 ---
 
@@ -19,8 +19,9 @@ bot-like behavior, and more. Your job is to find them.
 **Goal**: Understand the shape and quality of every dataset before writing any checks.
 
 **Tasks**:
-1. Load every raw dataset (users.csv, cdn_logs.csv, podcasts.json, episodes.json,
-   ad_events.json, metadata_changes.json, and all listening_events JSONL files).
+1. Load every raw dataset (yellow_tripdata parquet files, green_tripdata parquet files,
+   taxi_zone_lookup.csv, vendors.csv, rate_codes.csv, payment_types.csv, fhv_bases.csv,
+   and nyc_weather_2023.csv).
 2. For each dataset, compute:
    - Row count and column count
    - Null counts and null percentages per column
@@ -28,8 +29,8 @@ bot-like behavior, and more. Your job is to find them.
    - Unique value counts per column
    - Basic statistics (min, max, mean, std) for numeric columns
    - Sample values for string columns to spot inconsistencies
-3. Document every quality issue you find (mixed date formats, unexpected nulls,
-   negative values, inconsistent categories, etc.).
+3. Document every quality issue you find (null passenger counts, negative fares,
+   impossible distances, invalid location IDs, etc.).
 
 **Expected output**: A printed report for each dataset summarizing shape, nulls,
 duplicates, and specific issues discovered.
@@ -51,13 +52,13 @@ duplicates, and specific issues discovered.
    - **Accepted values**: Column values should be in an allowed set.
 2. Each check should return a result with: check name, column, passed (bool),
    total rows, failing rows, and failure percentage.
-3. Run checks against users.csv and cdn_logs.csv to validate:
-   - user_id is not null and is unique
-   - email matches a basic email pattern
-   - age is between 13 and 120
-   - gender is in a known set
-   - startup_time_ms is non-negative
-   - bytes_transferred is positive
+3. Run checks against yellow_tripdata and taxi_zone_lookup to validate:
+   - fare_amount is within a reasonable range (e.g., -50 to 5000)
+   - trip_distance is non-negative and below 500 miles
+   - passenger_count is between 0 and 9
+   - PULocationID and DOLocationID are between 1 and 265
+   - payment_type is in the valid set {1, 2, 3, 4, 5, 6}
+   - LocationID in zones is unique and not null
 
 **Expected output**: A table of check results showing pass/fail status and failure counts.
 
@@ -70,12 +71,14 @@ duplicates, and specific issues discovered.
 **Goal**: Validate that foreign key relationships hold across tables.
 
 **Tasks**:
-1. Check that every `user_id` in listening_events exists in users.csv.
-2. Check that every `episode_id` in listening_events exists in episodes.json.
-3. Check that every `podcast_id` in episodes.json exists in podcasts.json.
-4. Check that every `event_id` in cdn_logs.csv exists in listening_events.
-5. Check that every `event_id` in ad_events.json exists in listening_events.
-6. For each check, report the number and percentage of orphaned records.
+1. Check that every `PULocationID` in yellow trips exists in taxi_zone_lookup.LocationID.
+2. Check that every `DOLocationID` in yellow trips exists in taxi_zone_lookup.LocationID.
+3. Check that every `PULocationID` in green trips exists in taxi_zone_lookup.LocationID.
+4. Check that every `DOLocationID` in green trips exists in taxi_zone_lookup.LocationID.
+5. Check that every `VendorID` in yellow trips exists in vendors.vendor_id.
+6. Check that every `payment_type` in yellow trips exists in payment_types.payment_type_id.
+7. Check that every `RatecodeID` in yellow trips exists in rate_codes.rate_code_id.
+8. For each check, report the number and percentage of orphaned records.
 
 **Expected output**: A referential integrity report showing which relationships hold
 and which have orphaned foreign keys.
@@ -91,14 +94,14 @@ and which have orphaned foreign keys.
 **Tasks**:
 1. For each dataset with a timestamp column, find the most recent timestamp.
 2. Calculate the "freshness" as the time gap between now and the latest record.
-3. Define freshness SLOs (e.g., listening events should be < 24 hours old for a
+3. Define freshness SLOs (e.g., yellow trip data should be < 90 days old for a
    production system).
 4. Flag datasets that violate their freshness SLO.
-5. Check for gaps in the listening_events daily partitions -- are there missing dates
+5. Check for gaps in the monthly trip data files -- are there missing months
    in the sequence?
 
 **Expected output**: A freshness report showing the latest timestamp per dataset,
-the freshness gap, and whether the SLO is met. A list of missing partition dates.
+the freshness gap, and whether the SLO is met. A list of missing monthly files.
 
 **Solution**: `solutions/freshness_checks.py`
 
@@ -106,18 +109,17 @@ the freshness gap, and whether the SLO is met. A list of missing partition dates
 
 ## Exercise 5: Volume Anomaly Detection
 
-**Goal**: Detect days with unusually high or low event counts.
+**Goal**: Detect months with unusually high or low trip counts.
 
 **Tasks**:
-1. Count listening events per day across all partition files.
-2. Compute a 7-day rolling average and standard deviation.
-3. Flag days where the count is more than 2 standard deviations from the rolling mean.
-4. Also flag days where the count drops more than 50% compared to the previous day.
-5. Check for day-of-week seasonality: compare each day to the same weekday in the
-   prior week.
+1. Count trips per month across all yellow trip parquet files.
+2. Compute rolling statistics across available months.
+3. Flag months where the count deviates significantly from the rolling mean.
+4. Also flag months where the count drops more than 50% compared to the previous month.
+5. Compare yellow vs green trip volumes for consistency.
 
-**Expected output**: A table of daily counts with rolling stats, anomaly flags, and
-a summary of anomalous days found.
+**Expected output**: A table of monthly counts with rolling stats, anomaly flags, and
+a summary of anomalous months found.
 
 **Solution**: `solutions/volume_anomaly.py`
 
@@ -197,8 +199,8 @@ for each dataset.
 **Goal**: Define data contracts as YAML configuration and validate datasets against them.
 
 **Tasks**:
-1. Study the example contracts in `contracts/listening_events_contract.yml` and
-   `contracts/users_contract.yml`.
+1. Study the example contracts in `contracts/yellow_trips_contract.yml` and
+   `contracts/zones_contract.yml`.
 2. Implement a contract validator that:
    - Loads a contract YAML file.
    - Validates schema: checks that expected columns exist with correct types.

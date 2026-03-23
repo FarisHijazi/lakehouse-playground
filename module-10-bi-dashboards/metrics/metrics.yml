@@ -1,5 +1,5 @@
 # =============================================================================
-# Podcast Platform -- Metrics Definitions (Semantic / Metrics Layer)
+# NYC Taxi Analytics -- Metrics Definitions (Semantic / Metrics Layer)
 # =============================================================================
 # This file is the single source of truth for every business metric used in
 # dashboards, reports, and alerting.  Each entry follows a consistent schema:
@@ -7,8 +7,8 @@
 #   name            - snake_case identifier (unique)
 #   display_name    - human-friendly label shown in dashboards
 #   description     - what the metric measures and any nuances
-#   domain          - business area (growth, engagement, monetization, quality, content)
-#   type            - calculation type (count_distinct, sum, average, ratio, percentile)
+#   domain          - business area (volume, revenue, trip_characteristics, geographic, payment)
+#   type            - calculation type (count, sum, average, ratio, percentile)
 #   expression      - pseudo-SQL expression used to compute the metric
 #   source          - primary data source table / file
 #   dimensions      - columns the metric can be sliced by
@@ -21,314 +21,272 @@
 metrics:
 
   # ---------------------------------------------------------------------------
-  # Growth
+  # Trip Volume
   # ---------------------------------------------------------------------------
-  - name: daily_active_users
-    display_name: "Daily Active Users (DAU)"
+  - name: daily_trips
+    display_name: "Daily Trips"
     description: >
-      Count of unique users who triggered at least one listening event
-      on a given calendar day.
-    domain: growth
-    type: count_distinct
-    expression: "COUNT(DISTINCT user_id) -- per day"
-    source: listening_events
-    dimensions: [country, platform]
+      Total number of taxi trips completed on a given calendar day.
+    domain: volume
+    type: count
+    expression: "COUNT(*) -- per day"
+    source: yellow_tripdata
+    dimensions: [borough, vendor, payment_type]
     time_grains: [day]
-    owner: growth-team
-    thresholds:
-      warning_below: 500
-      critical_below: 200
-    tags: [executive, growth]
-
-  - name: weekly_active_users
-    display_name: "Weekly Active Users (WAU)"
-    description: >
-      Count of unique users with at least one listening event in the
-      trailing 7-day window.
-    domain: growth
-    type: count_distinct
-    expression: "COUNT(DISTINCT user_id) WHERE event_date >= current_date - 7"
-    source: listening_events
-    dimensions: [country, platform]
-    time_grains: [day, week]
-    owner: growth-team
-    thresholds:
-      warning_below: 2000
-      critical_below: 1000
-    tags: [executive, growth]
-
-  - name: monthly_active_users
-    display_name: "Monthly Active Users (MAU)"
-    description: >
-      Count of unique users with at least one listening event in the
-      trailing 30-day window.
-    domain: growth
-    type: count_distinct
-    expression: "COUNT(DISTINCT user_id) WHERE event_date >= current_date - 30"
-    source: listening_events
-    dimensions: [country, platform, subscription_type]
-    time_grains: [day, week, month]
-    owner: growth-team
+    owner: analytics-team
     thresholds:
       warning_below: 5000
-      critical_below: 2000
-    tags: [executive, growth]
+      critical_below: 1000
+    tags: [executive, volume]
 
-  - name: dau_mau_ratio
-    display_name: "Stickiness (DAU/MAU)"
+  - name: trips_per_hour
+    display_name: "Avg Trips per Hour"
     description: >
-      Ratio of daily active users to monthly active users. A higher value
-      indicates users return more frequently. Benchmark: > 0.2 is healthy.
-    domain: growth
-    type: ratio
-    expression: "DAU / MAU"
-    source: listening_events
-    dimensions: [country, platform]
-    time_grains: [day]
-    owner: growth-team
-    thresholds:
-      warning_below: 0.15
-      critical_below: 0.08
-    tags: [executive, growth, engagement]
-
-  # ---------------------------------------------------------------------------
-  # Engagement
-  # ---------------------------------------------------------------------------
-  - name: avg_listen_duration_seconds
-    display_name: "Avg Listen Duration (seconds)"
-    description: >
-      Mean listened_seconds across all listening events.
-    domain: engagement
+      Average number of trips per hour across the dataset, measuring
+      overall fleet utilization.
+    domain: volume
     type: average
-    expression: "AVG(listened_seconds)"
-    source: listening_events
-    dimensions: [country, platform, podcast_id]
+    expression: "COUNT(*) / COUNT(DISTINCT hour) -- per day"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
+    time_grains: [day, week]
+    owner: analytics-team
+    thresholds:
+      warning_below: 200
+      critical_below: 50
+    tags: [volume, operations]
+
+  - name: avg_passenger_count
+    display_name: "Avg Passengers per Trip"
+    description: >
+      Mean passenger_count across all trips. Indicates vehicle occupancy.
+    domain: volume
+    type: average
+    expression: "AVG(passenger_count)"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
     time_grains: [day, week, month]
-    owner: product-team
+    owner: analytics-team
     thresholds:
-      warning_below: 600
-      critical_below: 300
-    tags: [engagement, content]
-
-  - name: completion_rate
-    display_name: "Episode Completion Rate"
-    description: >
-      Fraction of listening events with event_type = 'complete' out of all
-      play-related events (play, resume, complete).
-    domain: engagement
-    type: ratio
-    expression: >
-      COUNT(*) FILTER (WHERE event_type = 'complete') /
-      NULLIF(COUNT(*) FILTER (WHERE event_type IN ('play','resume','complete')), 0)
-    source: listening_events
-    dimensions: [podcast_id, platform, country]
-    time_grains: [day, week, month]
-    owner: product-team
-    thresholds:
-      warning_below: 0.20
-      critical_below: 0.10
-    tags: [engagement, content, executive]
-
-  - name: listener_retention_d7
-    display_name: "D7 Retention"
-    description: >
-      Percentage of users who had a listening event within 7 days after
-      their first listening event.
-    domain: engagement
-    type: ratio
-    expression: >
-      Users active on day 7 / Users in cohort
-    source: listening_events
-    dimensions: [country, platform]
-    time_grains: [week, month]
-    owner: growth-team
-    thresholds:
-      warning_below: 0.25
-      critical_below: 0.10
-    tags: [retention, growth]
-
-  - name: monthly_churn_rate
-    display_name: "Monthly Churn Rate"
-    description: >
-      Fraction of previous month's active users who did not have any
-      listening event in the current month.
-    domain: engagement
-    type: ratio
-    expression: "(MAU_prev - retained_users) / MAU_prev"
-    source: listening_events
-    dimensions: [country, subscription_type]
-    time_grains: [month]
-    owner: growth-team
-    thresholds:
-      warning_above: 0.30
-      critical_above: 0.50
-    tags: [retention, growth, executive]
+      warning_below: 1.0
+      critical_below: 0.5
+    tags: [volume]
 
   # ---------------------------------------------------------------------------
-  # Content
+  # Revenue & Fares
   # ---------------------------------------------------------------------------
-  - name: top_podcasts_by_plays
-    display_name: "Top Podcasts by Plays"
+  - name: total_revenue
+    display_name: "Total Revenue ($)"
     description: >
-      Podcasts ranked by total number of listening events.
-    domain: content
-    type: count_distinct
-    expression: "COUNT(*) GROUP BY podcast_id ORDER BY COUNT(*) DESC"
-    source: listening_events
-    dimensions: [category, language]
-    time_grains: [day, week, month]
-    owner: content-team
-    thresholds: {}
-    tags: [content, executive]
-
-  - name: trending_episodes
-    display_name: "Trending Episodes"
-    description: >
-      Episodes whose play count in the last 7 days exceeds their play
-      count in the prior 7 days by at least 20%.
-    domain: content
-    type: ratio
-    expression: "(plays_last_7d - plays_prev_7d) / NULLIF(plays_prev_7d, 0)"
-    source: listening_events
-    dimensions: [podcast_id, category]
-    time_grains: [week]
-    owner: content-team
-    thresholds: {}
-    tags: [content]
-
-  # ---------------------------------------------------------------------------
-  # Monetization
-  # ---------------------------------------------------------------------------
-  - name: total_ad_revenue
-    display_name: "Total Ad Revenue (SAR)"
-    description: >
-      Sum of revenue_sar across all ad impression events.
-    domain: monetization
+      Sum of total_amount across all trips, representing gross revenue
+      including fare, tips, tolls, and surcharges.
+    domain: revenue
     type: sum
-    expression: "SUM(revenue_sar)"
-    source: ad_events
-    dimensions: [ad_type, advertiser, campaign_id]
+    expression: "SUM(total_amount)"
+    source: yellow_tripdata
+    dimensions: [borough, vendor, payment_type]
     time_grains: [day, week, month]
-    owner: revenue-team
+    owner: analytics-team
     thresholds:
-      warning_below: 10000
-      critical_below: 5000
+      warning_below: 50000
+      critical_below: 10000
     tags: [revenue, executive]
 
-  - name: ad_fill_rate
-    display_name: "Ad Fill Rate"
+  - name: avg_fare_amount
+    display_name: "Average Fare ($)"
     description: >
-      Fraction of ad opportunity events that resulted in an impression.
-    domain: monetization
-    type: ratio
-    expression: "COUNT(impression) / COUNT(all ad opportunities)"
-    source: ad_events
-    dimensions: [ad_type]
-    time_grains: [day, week, month]
-    owner: revenue-team
-    thresholds:
-      warning_below: 0.70
-      critical_below: 0.50
-    tags: [revenue]
-
-  - name: effective_cpm
-    display_name: "Effective CPM (SAR)"
-    description: >
-      Revenue per 1,000 ad impressions.
-    domain: monetization
-    type: ratio
-    expression: "SUM(revenue_sar) / NULLIF(COUNT(impressions), 0) * 1000"
-    source: ad_events
-    dimensions: [ad_type, advertiser]
-    time_grains: [day, week, month]
-    owner: revenue-team
-    thresholds:
-      warning_below: 5.0
-      critical_below: 2.0
-    tags: [revenue]
-
-  - name: ad_click_through_rate
-    display_name: "Ad Click-Through Rate (CTR)"
-    description: >
-      Fraction of ad impressions that received a click.
-    domain: monetization
-    type: ratio
-    expression: "COUNT(clicks) / NULLIF(COUNT(impressions), 0)"
-    source: ad_events
-    dimensions: [ad_type, advertiser, campaign_id]
-    time_grains: [day, week, month]
-    owner: revenue-team
-    thresholds:
-      warning_below: 0.005
-      critical_below: 0.001
-    tags: [revenue]
-
-  # ---------------------------------------------------------------------------
-  # Streaming Quality
-  # ---------------------------------------------------------------------------
-  - name: rebuffer_rate
-    display_name: "Rebuffer Rate"
-    description: >
-      Average rebuffer_ratio across all CDN streaming sessions.
-    domain: quality
+      Mean fare_amount across all trips with positive fare.
+    domain: revenue
     type: average
-    expression: "AVG(rebuffer_ratio)"
-    source: cdn_logs
-    dimensions: [cdn_node, isp, bitrate]
-    time_grains: [hour, day]
-    owner: infrastructure-team
+    expression: "AVG(fare_amount) WHERE fare_amount > 0"
+    source: yellow_tripdata
+    dimensions: [borough, vendor, payment_type]
+    time_grains: [day, week, month]
+    owner: analytics-team
     thresholds:
-      warning_above: 0.02
-      critical_above: 0.05
-    tags: [quality, infrastructure]
+      warning_below: 8.0
+      critical_below: 5.0
+    tags: [revenue, executive]
 
-  - name: median_startup_time_ms
-    display_name: "Median Startup Time (ms)"
+  - name: avg_tip_percentage
+    display_name: "Avg Tip Percentage"
     description: >
-      Median time from play request to first audio byte, in milliseconds.
-    domain: quality
-    type: percentile
-    expression: "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY startup_time_ms)"
-    source: cdn_logs
-    dimensions: [cdn_node, isp, bitrate]
-    time_grains: [hour, day]
-    owner: infrastructure-team
-    thresholds:
-      warning_above: 2000
-      critical_above: 4000
-    tags: [quality, infrastructure]
-
-  - name: streaming_error_rate
-    display_name: "Streaming Error Rate"
-    description: >
-      Fraction of CDN sessions that encountered a non-null error_type.
-    domain: quality
+      Mean tip as a fraction of fare, computed only for trips where
+      fare_amount > 0 (tip_amount / fare_amount).
+    domain: revenue
     type: ratio
-    expression: >
-      COUNT(*) FILTER (WHERE error_type IS NOT NULL) / COUNT(*)
-    source: cdn_logs
-    dimensions: [cdn_node, isp, error_type]
-    time_grains: [hour, day]
-    owner: infrastructure-team
+    expression: "AVG(tip_amount / NULLIF(fare_amount, 0)) WHERE fare_amount > 0"
+    source: yellow_tripdata
+    dimensions: [borough, payment_type]
+    time_grains: [day, week, month]
+    owner: analytics-team
     thresholds:
-      warning_above: 0.05
-      critical_above: 0.10
-    tags: [quality, infrastructure]
+      warning_below: 0.10
+      critical_below: 0.05
+    tags: [revenue]
+
+  - name: revenue_per_mile
+    display_name: "Revenue per Mile ($)"
+    description: >
+      Total revenue divided by total trip miles, measuring fare efficiency.
+    domain: revenue
+    type: ratio
+    expression: "SUM(total_amount) / NULLIF(SUM(trip_distance), 0)"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds:
+      warning_below: 3.0
+      critical_below: 2.0
+    tags: [revenue, operations]
+
+  # ---------------------------------------------------------------------------
+  # Trip Characteristics
+  # ---------------------------------------------------------------------------
+  - name: avg_trip_distance
+    display_name: "Avg Trip Distance (miles)"
+    description: >
+      Mean trip_distance in miles across all trips.
+    domain: trip_characteristics
+    type: average
+    expression: "AVG(trip_distance)"
+    source: yellow_tripdata
+    dimensions: [borough, vendor, payment_type]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds:
+      warning_below: 1.0
+      critical_below: 0.5
+    tags: [trip_characteristics, executive]
+
+  - name: avg_trip_duration_minutes
+    display_name: "Avg Trip Duration (min)"
+    description: >
+      Mean trip duration in minutes, computed as the difference between
+      dropoff and pickup timestamps.
+    domain: trip_characteristics
+    type: average
+    expression: "AVG(DATEDIFF('minute', tpep_pickup_datetime, tpep_dropoff_datetime))"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds:
+      warning_above: 60
+      critical_above: 120
+    tags: [trip_characteristics]
+
+  - name: p95_trip_duration_minutes
+    display_name: "P95 Trip Duration (min)"
+    description: >
+      95th percentile trip duration in minutes. Useful for identifying
+      unusually long trips.
+    domain: trip_characteristics
+    type: percentile
+    expression: "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_minutes)"
+    source: yellow_tripdata
+    dimensions: [borough]
+    time_grains: [day, week]
+    owner: analytics-team
+    thresholds:
+      warning_above: 60
+      critical_above: 90
+    tags: [trip_characteristics, operations]
+
+  - name: short_trip_rate
+    display_name: "Short Trip Rate (< 1 mile)"
+    description: >
+      Fraction of trips with trip_distance under 1 mile.
+    domain: trip_characteristics
+    type: ratio
+    expression: "COUNT(*) FILTER (WHERE trip_distance < 1) / NULLIF(COUNT(*), 0)"
+    source: yellow_tripdata
+    dimensions: [borough]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds: {}
+    tags: [trip_characteristics]
 
   # ---------------------------------------------------------------------------
   # Geographic
   # ---------------------------------------------------------------------------
-  - name: listeners_by_country
-    display_name: "Listeners by Country"
+  - name: trips_by_borough
+    display_name: "Trips by Pickup Borough"
     description: >
-      Unique listeners broken down by country, derived from the country
-      field in listening events.
-    domain: growth
-    type: count_distinct
-    expression: "COUNT(DISTINCT user_id) GROUP BY country"
-    source: listening_events
-    dimensions: [platform, subscription_type]
+      Trip count broken down by pickup borough, derived by joining
+      PULocationID to the taxi zone lookup.
+    domain: geographic
+    type: count
+    expression: "COUNT(*) GROUP BY borough"
+    source: yellow_tripdata
+    dimensions: [vendor, payment_type]
     time_grains: [day, week, month]
-    owner: growth-team
+    owner: analytics-team
     thresholds: {}
-    tags: [geographic, growth]
+    tags: [geographic, executive]
+
+  - name: top_pickup_zones
+    display_name: "Top Pickup Zones"
+    description: >
+      Zones ranked by total number of pickups.
+    domain: geographic
+    type: count
+    expression: "COUNT(*) GROUP BY PULocationID ORDER BY COUNT(*) DESC"
+    source: yellow_tripdata
+    dimensions: [borough]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds: {}
+    tags: [geographic]
+
+  - name: cross_borough_rate
+    display_name: "Cross-Borough Trip Rate"
+    description: >
+      Fraction of trips where the pickup borough differs from the dropoff
+      borough, indicating inter-borough mobility.
+    domain: geographic
+    type: ratio
+    expression: >
+      COUNT(*) FILTER (WHERE pu_borough != do_borough) /
+      NULLIF(COUNT(*), 0)
+    source: yellow_tripdata
+    dimensions: []
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds: {}
+    tags: [geographic]
+
+  # ---------------------------------------------------------------------------
+  # Payment
+  # ---------------------------------------------------------------------------
+  - name: credit_card_rate
+    display_name: "Credit Card Payment Rate"
+    description: >
+      Fraction of trips paid by credit card (payment_type = 1).
+    domain: payment
+    type: ratio
+    expression: "COUNT(*) FILTER (WHERE payment_type = 1) / NULLIF(COUNT(*), 0)"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds: {}
+    tags: [payment]
+
+  - name: avg_tip_credit_card
+    display_name: "Avg Tip (Credit Card)"
+    description: >
+      Average tip amount for credit card trips only, since cash tips
+      are not recorded in the data.
+    domain: payment
+    type: average
+    expression: "AVG(tip_amount) WHERE payment_type = 1"
+    source: yellow_tripdata
+    dimensions: [borough, vendor]
+    time_grains: [day, week, month]
+    owner: analytics-team
+    thresholds:
+      warning_below: 1.50
+      critical_below: 0.50
+    tags: [payment, revenue]

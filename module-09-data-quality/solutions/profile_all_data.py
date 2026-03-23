@@ -10,7 +10,6 @@ Loads every raw dataset and produces a detailed quality profile:
   - Specific quality issues discovered
 """
 
-import json
 from pathlib import Path
 
 import duckdb
@@ -18,20 +17,6 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
-
-
-def load_listening_events() -> pd.DataFrame:
-    """Load all listening event JSONL partition files into one dataframe."""
-    events_dir = RAW_DIR / "listening_events"
-    frames = []
-    for f in sorted(events_dir.glob("events_*.jsonl")):
-        lines = f.read_text().strip().split("\n")
-        records = [json.loads(line) for line in lines if line.strip()]
-        if records:
-            frames.append(pd.DataFrame(records))
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
 
 
 def profile_dataset(name: str, df: pd.DataFrame, key_columns: list[str] | None = None):
@@ -100,74 +85,68 @@ def find_specific_issues(name: str, df: pd.DataFrame):
     """Check for known quality issues in each dataset."""
     issues = []
 
-    if name == "users":
-        # Mixed date formats
-        if "signup_date" in df.columns:
-            dates = df["signup_date"].dropna()
-            iso_count = dates.str.match(r"^\d{4}-\d{2}-\d{2}$").sum()
-            iso_t_count = dates.str.match(r"^\d{4}-\d{2}-\d{2}T").sum()
-            slash_dmy = dates.str.match(r"^\d{2}/\d{2}/\d{4}$").sum()
-            dash_mdy = dates.str.match(r"^\d{2}-\d{2}-\d{4}$").sum()
-            other = len(dates) - iso_count - iso_t_count - slash_dmy - dash_mdy
-            issues.append(f"signup_date has mixed formats: "
-                          f"YYYY-MM-DD={iso_count}, YYYY-MM-DDThh:mm:ss={iso_t_count}, "
-                          f"DD/MM/YYYY={slash_dmy}, MM-DD-YYYY={dash_mdy}, other={other}")
-
-        # Inconsistent gender
-        if "gender" in df.columns:
-            genders = df["gender"].dropna().unique().tolist()
-            issues.append(f"Gender values are inconsistent: {sorted(genders)}")
-            empty_gender = (df["gender"] == "").sum()
-            if empty_gender > 0:
-                issues.append(f"Gender has {empty_gender} empty strings (not null)")
-
-        # Missing emails
-        if "email" in df.columns:
-            null_emails = df["email"].isnull().sum()
-            if null_emails > 0:
-                issues.append(f"{null_emails} users have no email address")
-
-        # Duplicate user IDs
-        if "user_id" in df.columns:
-            dup_ids = df["user_id"].dropna().duplicated()
-            if dup_ids.sum() > 0:
-                duped = df[df["user_id"].duplicated(keep=False)]["user_id"].unique()
-                issues.append(f"Duplicate user_ids found: {list(duped)}")
-
-    if name == "cdn_logs":
-        if "startup_time_ms" in df.columns:
-            negs = (df["startup_time_ms"] < 0).sum()
+    if name == "yellow_tripdata":
+        if "fare_amount" in df.columns:
+            negs = (df["fare_amount"] < 0).sum()
             if negs > 0:
-                issues.append(f"startup_time_ms has {negs} negative values")
-        if "bytes_transferred" in df.columns:
-            negs = (df["bytes_transferred"] <= 0).sum()
-            if negs > 0:
-                issues.append(f"bytes_transferred has {negs} non-positive values")
+                issues.append(f"fare_amount has {negs:,} negative values")
+            extremes = (df["fare_amount"] > 5000).sum()
+            if extremes > 0:
+                issues.append(f"fare_amount has {extremes:,} extreme values (>$5000)")
 
-    if name == "listening_events":
-        if "listened_seconds" in df.columns:
-            negs = (df["listened_seconds"] < 0).sum()
-            if negs > 0:
-                issues.append(f"listened_seconds has {negs} negative values")
-        if "event_type" in df.columns:
-            expected = {"play", "pause", "seek", "complete", "skip"}
-            actual = set(df["event_type"].dropna().unique())
-            unexpected = actual - expected
-            if unexpected:
-                issues.append(f"Unexpected event_type values: {unexpected}")
-        if "event_id" in df.columns:
-            dupes = df["event_id"].dropna().duplicated().sum()
-            if dupes > 0:
-                issues.append(f"event_id has {dupes} duplicates")
-
-    if name == "ad_events":
-        if "revenue_sar" in df.columns:
-            zeros = (df["revenue_sar"] == 0).sum()
-            negs = (df["revenue_sar"] < 0).sum()
+        if "trip_distance" in df.columns:
+            zeros = (df["trip_distance"] == 0).sum()
             if zeros > 0:
-                issues.append(f"revenue_sar has {zeros} zero values")
+                issues.append(f"trip_distance has {zeros:,} zero values")
+            negs = (df["trip_distance"] < 0).sum()
             if negs > 0:
-                issues.append(f"revenue_sar has {negs} negative values")
+                issues.append(f"trip_distance has {negs:,} negative values")
+
+        if "passenger_count" in df.columns:
+            nulls = df["passenger_count"].isnull().sum()
+            if nulls > 0:
+                issues.append(f"passenger_count has {nulls:,} null values")
+            zeros = (df["passenger_count"] == 0).sum()
+            if zeros > 0:
+                issues.append(f"passenger_count has {zeros:,} zero values")
+
+        if "PULocationID" in df.columns:
+            invalid = ((df["PULocationID"] < 1) | (df["PULocationID"] > 265)).sum()
+            if invalid > 0:
+                issues.append(f"PULocationID has {invalid:,} values outside [1, 265]")
+
+        if "DOLocationID" in df.columns:
+            invalid = ((df["DOLocationID"] < 1) | (df["DOLocationID"] > 265)).sum()
+            if invalid > 0:
+                issues.append(f"DOLocationID has {invalid:,} values outside [1, 265]")
+
+        if "total_amount" in df.columns:
+            negs = (df["total_amount"] < 0).sum()
+            if negs > 0:
+                issues.append(f"total_amount has {negs:,} negative values")
+
+    if name == "green_tripdata":
+        if "fare_amount" in df.columns:
+            negs = (df["fare_amount"] < 0).sum()
+            if negs > 0:
+                issues.append(f"fare_amount has {negs:,} negative values")
+        if "trip_distance" in df.columns:
+            zeros = (df["trip_distance"] == 0).sum()
+            if zeros > 0:
+                issues.append(f"trip_distance has {zeros:,} zero values")
+        if "passenger_count" in df.columns:
+            nulls = df["passenger_count"].isnull().sum()
+            if nulls > 0:
+                issues.append(f"passenger_count has {nulls:,} null values")
+
+    if name == "taxi_zone_lookup":
+        if "LocationID" in df.columns:
+            dupes = df["LocationID"].duplicated().sum()
+            if dupes > 0:
+                issues.append(f"LocationID has {dupes:,} duplicates")
+        if "Borough" in df.columns:
+            boroughs = df["Borough"].unique().tolist()
+            issues.append(f"Borough values: {sorted(boroughs)}")
 
     if issues:
         print(f"\n  --- Quality Issues Found ---")
@@ -183,65 +162,91 @@ def main():
     print("  All raw datasets at:", RAW_DIR)
     print("=" * 80)
 
-    # 1. Users
-    users = pd.read_csv(RAW_DIR / "users.csv")
-    profile_dataset("users", users, key_columns=["user_id", "email"])
-    find_specific_issues("users", users)
+    # 1. Yellow Tripdata
+    yellow_frames = []
+    for f in sorted(RAW_DIR.glob("yellow_tripdata_*.parquet")):
+        yellow_frames.append(pd.read_parquet(f))
+    if yellow_frames:
+        yellow = pd.concat(yellow_frames, ignore_index=True)
+        profile_dataset("yellow_tripdata", yellow,
+                        key_columns=["VendorID", "PULocationID", "DOLocationID"])
+        find_specific_issues("yellow_tripdata", yellow)
+    else:
+        print("\n  No yellow_tripdata parquet files found.")
 
-    # 2. CDN Logs
-    cdn = pd.read_csv(RAW_DIR / "cdn_logs.csv")
-    profile_dataset("cdn_logs", cdn, key_columns=["log_id", "event_id"])
-    find_specific_issues("cdn_logs", cdn)
+    # 2. Green Tripdata
+    green_frames = []
+    for f in sorted(RAW_DIR.glob("green_tripdata_*.parquet")):
+        green_frames.append(pd.read_parquet(f))
+    if green_frames:
+        green = pd.concat(green_frames, ignore_index=True)
+        profile_dataset("green_tripdata", green,
+                        key_columns=["VendorID", "PULocationID", "DOLocationID"])
+        find_specific_issues("green_tripdata", green)
+    else:
+        print("\n  No green_tripdata parquet files found.")
 
-    # 3. Podcasts
-    podcasts = pd.DataFrame(json.loads((RAW_DIR / "podcasts.json").read_text()))
-    profile_dataset("podcasts", podcasts, key_columns=["podcast_id"])
-    find_specific_issues("podcasts", podcasts)
+    # 3. Taxi Zone Lookup
+    zones = pd.read_csv(RAW_DIR / "taxi_zone_lookup.csv")
+    profile_dataset("taxi_zone_lookup", zones, key_columns=["LocationID"])
+    find_specific_issues("taxi_zone_lookup", zones)
 
-    # 4. Episodes
-    episodes = pd.DataFrame(json.loads((RAW_DIR / "episodes.json").read_text()))
-    profile_dataset("episodes", episodes, key_columns=["episode_id"])
-    find_specific_issues("episodes", episodes)
+    # 4. Vendors
+    vendors = pd.read_csv(RAW_DIR / "vendors.csv")
+    profile_dataset("vendors", vendors, key_columns=["vendor_id"])
+    find_specific_issues("vendors", vendors)
 
-    # 5. Ad Events
-    ad_events = pd.DataFrame(json.loads((RAW_DIR / "ad_events.json").read_text()))
-    profile_dataset("ad_events", ad_events, key_columns=["ad_event_id", "event_id"])
-    find_specific_issues("ad_events", ad_events)
+    # 5. Rate Codes
+    rate_codes = pd.read_csv(RAW_DIR / "rate_codes.csv")
+    profile_dataset("rate_codes", rate_codes, key_columns=["rate_code_id"])
+    find_specific_issues("rate_codes", rate_codes)
 
-    # 6. Metadata Changes
-    meta = pd.DataFrame(json.loads((RAW_DIR / "metadata_changes.json").read_text()))
-    profile_dataset("metadata_changes", meta)
-    find_specific_issues("metadata_changes", meta)
+    # 6. Payment Types
+    payment_types = pd.read_csv(RAW_DIR / "payment_types.csv")
+    profile_dataset("payment_types", payment_types, key_columns=["payment_type_id"])
+    find_specific_issues("payment_types", payment_types)
 
-    # 7. Listening Events (sampled summary + full stats)
-    print(f"\n  Loading listening events (this may take a moment)...")
-    events = load_listening_events()
-    profile_dataset("listening_events", events, key_columns=["event_id", "user_id"])
-    find_specific_issues("listening_events", events)
+    # 7. FHV Bases
+    fhv_bases = pd.read_csv(RAW_DIR / "fhv_bases.csv")
+    profile_dataset("fhv_bases", fhv_bases, key_columns=["base_license_num"])
+    find_specific_issues("fhv_bases", fhv_bases)
 
-    # Summary using DuckDB for fast aggregation
-    print(f"\n{'=' * 80}")
-    print("  DUCKDB QUICK STATS")
-    print(f"{'=' * 80}")
-    con = duckdb.connect()
-    con.execute("CREATE TABLE events AS SELECT * FROM events")  # noqa
-    result = con.execute("""
-        SELECT
-            COUNT(*) AS total_rows,
-            COUNT(DISTINCT event_id) AS unique_events,
-            COUNT(*) - COUNT(DISTINCT event_id) AS duplicate_events,
-            COUNT(DISTINCT user_id) AS unique_users,
-            COUNT(DISTINCT episode_id) AS unique_episodes,
-            MIN(timestamp) AS earliest,
-            MAX(timestamp) AS latest
-        FROM events
-    """).fetchone()
-    labels = ["total_rows", "unique_events", "duplicate_events",
-              "unique_users", "unique_episodes", "earliest", "latest"]
-    for label, val in zip(labels, result):
-        print(f"    {label}: {val}")
+    # 8. NYC Weather
+    weather_path = RAW_DIR / "nyc_weather_2023.csv"
+    if weather_path.exists():
+        weather = pd.read_csv(weather_path)
+        profile_dataset("nyc_weather_2023", weather)
+        find_specific_issues("nyc_weather_2023", weather)
 
-    con.close()
+    # Summary using DuckDB for fast aggregation on yellow trips
+    if yellow_frames:
+        print(f"\n{'=' * 80}")
+        print("  DUCKDB QUICK STATS (yellow_tripdata)")
+        print(f"{'=' * 80}")
+        con = duckdb.connect()
+        con.execute("CREATE TABLE yellow AS SELECT * FROM yellow")  # noqa
+        result = con.execute("""
+            SELECT
+                COUNT(*) AS total_rows,
+                COUNT(DISTINCT VendorID) AS unique_vendors,
+                COUNT(DISTINCT PULocationID) AS unique_pickup_zones,
+                COUNT(DISTINCT DOLocationID) AS unique_dropoff_zones,
+                MIN(tpep_pickup_datetime) AS earliest_pickup,
+                MAX(tpep_pickup_datetime) AS latest_pickup,
+                AVG(trip_distance) AS avg_distance,
+                AVG(fare_amount) AS avg_fare,
+                AVG(total_amount) AS avg_total
+            FROM yellow
+        """).fetchone()
+        labels = ["total_rows", "unique_vendors", "unique_pickup_zones",
+                  "unique_dropoff_zones", "earliest_pickup", "latest_pickup",
+                  "avg_distance", "avg_fare", "avg_total"]
+        for label, val in zip(labels, result):
+            if isinstance(val, float):
+                print(f"    {label}: {val:.2f}")
+            else:
+                print(f"    {label}: {val}")
+        con.close()
 
     print(f"\n{'=' * 80}")
     print("  PROFILING COMPLETE")
