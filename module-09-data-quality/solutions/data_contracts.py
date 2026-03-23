@@ -5,8 +5,6 @@ Loads data contract YAML files and validates datasets against them.
 Checks schema (columns, types, nullability, uniqueness) and quality rules.
 """
 
-import json
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +19,7 @@ TYPE_MAP = {
     "string": "object",
     "integer": "int64",
     "float": "float64",
+    "datetime": "datetime64",
 }
 
 
@@ -205,9 +204,9 @@ def validate_contract(contract_path: Path, df: pd.DataFrame):
     freshness_conf = contract.get("freshness")
     if freshness_conf:
         ts_col = freshness_conf.get("timestamp_column")
-        max_hours = freshness_conf.get("max_delay_hours", 24)
+        max_hours = freshness_conf.get("max_delay_hours", 720)
         if ts_col and ts_col in df.columns:
-            parsed = pd.to_datetime(df[ts_col], errors="coerce", format="mixed")
+            parsed = pd.to_datetime(df[ts_col], errors="coerce")
             valid = parsed.dropna()
             if not valid.empty:
                 from datetime import datetime
@@ -219,8 +218,8 @@ def validate_contract(contract_path: Path, df: pd.DataFrame):
     # Volume check (if defined)
     volume_conf = contract.get("volume")
     if volume_conf:
-        min_rows = volume_conf.get("min_rows") or volume_conf.get("min_daily_rows", 0)
-        max_rows = volume_conf.get("max_rows") or volume_conf.get("max_daily_rows", float("inf"))
+        min_rows = volume_conf.get("min_rows", 0)
+        max_rows = volume_conf.get("max_rows", float("inf"))
         row_count = len(df)
         in_range = min_rows <= row_count <= max_rows
         status = "PASS" if in_range else "FAIL"
@@ -243,27 +242,22 @@ def main():
 
     summaries = []
 
-    # Validate listening_events contract
-    contract_path = CONTRACTS_DIR / "listening_events_contract.yml"
+    # Validate yellow_trips contract
+    contract_path = CONTRACTS_DIR / "yellow_trips_contract.yml"
     if contract_path.exists():
-        events_dir = RAW_DIR / "listening_events"
-        partition_files = sorted(events_dir.glob("events_*.jsonl"))
-        sample_files = partition_files[-10:] if len(partition_files) > 10 else partition_files
-        frames = []
-        for f in sample_files:
-            lines = f.read_text().strip().split("\n")
-            records = [json.loads(line) for line in lines if line.strip()]
-            if records:
-                frames.append(pd.DataFrame(records))
-        events_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        result = validate_contract(contract_path, events_df)
-        summaries.append(result)
+        yellow_frames = []
+        for f in sorted(RAW_DIR.glob("yellow_tripdata_*.parquet")):
+            yellow_frames.append(pd.read_parquet(f))
+        yellow_df = pd.concat(yellow_frames, ignore_index=True) if yellow_frames else pd.DataFrame()
+        if not yellow_df.empty:
+            result = validate_contract(contract_path, yellow_df)
+            summaries.append(result)
 
-    # Validate users contract
-    contract_path = CONTRACTS_DIR / "users_contract.yml"
+    # Validate zones contract
+    contract_path = CONTRACTS_DIR / "zones_contract.yml"
     if contract_path.exists():
-        users_df = pd.read_csv(RAW_DIR / "users.csv")
-        result = validate_contract(contract_path, users_df)
+        zones_df = pd.read_csv(RAW_DIR / "taxi_zone_lookup.csv")
+        result = validate_contract(contract_path, zones_df)
         summaries.append(result)
 
     # Overall summary

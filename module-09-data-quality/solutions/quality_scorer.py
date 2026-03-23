@@ -9,7 +9,6 @@ Assigns a 0-100 weighted quality score to each dataset across five dimensions:
   - Timeliness (10%): whether data meets freshness SLO
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -87,7 +86,7 @@ def score_validity(df: pd.DataFrame, checks: list[dict]) -> float:
 
 
 def score_consistency(df: pd.DataFrame, format_checks: list[dict]) -> float:
-    """Percentage of values matching expected format (e.g., date format, gender codes)."""
+    """Percentage of values matching expected format."""
     if not format_checks:
         return 100.0
     total_pass = 0
@@ -103,15 +102,15 @@ def score_consistency(df: pd.DataFrame, format_checks: list[dict]) -> float:
     return (total_pass / total_checked * 100) if total_checked > 0 else 100.0
 
 
-def score_timeliness(latest_timestamp: datetime | None, max_hours: int) -> float:
+def score_timeliness(latest_timestamp: datetime | None, max_days: int) -> float:
     """100 if within SLO, scaled down based on how late."""
     if latest_timestamp is None:
         return 0.0
-    gap_hours = (datetime.now() - latest_timestamp).total_seconds() / 3600
-    if gap_hours <= max_hours:
+    gap_days = (datetime.now() - latest_timestamp).total_seconds() / 86400
+    if gap_days <= max_days:
         return 100.0
     # Scale: at 2x the SLO, score = 50; at 3x, score = 0
-    ratio = gap_hours / max_hours
+    ratio = gap_days / max_days
     return max(0.0, (1 - (ratio - 1) / 2) * 100)
 
 
@@ -136,13 +135,13 @@ def score_dataset(
     validity_checks: list[dict],
     format_checks: list[dict],
     latest_timestamp: datetime | None,
-    freshness_slo_hours: int,
+    freshness_slo_days: int,
 ) -> dict:
     comp = score_completeness(df, required_columns)
     uniq = score_uniqueness(df, key_columns)
     valid = score_validity(df, validity_checks)
     cons = score_consistency(df, format_checks)
-    timely = score_timeliness(latest_timestamp, freshness_slo_hours)
+    timely = score_timeliness(latest_timestamp, freshness_slo_days)
 
     overall = (
         comp * WEIGHTS["completeness"]
@@ -165,7 +164,7 @@ def score_dataset(
 
 
 def get_latest_ts(df: pd.DataFrame, col: str) -> datetime | None:
-    parsed = pd.to_datetime(df[col], errors="coerce", format="mixed")
+    parsed = pd.to_datetime(df[col], errors="coerce")
     valid = parsed.dropna()
     return valid.max().to_pydatetime() if not valid.empty else None
 
@@ -177,152 +176,122 @@ def main():
 
     results = []
 
-    # --- Users ---
-    users = pd.read_csv(RAW_DIR / "users.csv")
+    # --- Yellow Tripdata ---
+    yellow_frames = []
+    for f in sorted(RAW_DIR.glob("yellow_tripdata_*.parquet")):
+        yellow_frames.append(pd.read_parquet(f))
+    yellow = pd.concat(yellow_frames, ignore_index=True) if yellow_frames else pd.DataFrame()
+
+    if not yellow.empty:
+        results.append(score_dataset(
+            name="yellow_tripdata",
+            df=yellow,
+            required_columns=["tpep_pickup_datetime", "tpep_dropoff_datetime",
+                              "PULocationID", "DOLocationID", "fare_amount",
+                              "total_amount", "trip_distance"],
+            key_columns=[],  # no natural unique key in trip data
+            validity_checks=[
+                {"column": "fare_amount", "type": "range", "min": -50, "max": 5000},
+                {"column": "trip_distance", "type": "range", "min": 0, "max": 500},
+                {"column": "passenger_count", "type": "range", "min": 0, "max": 9},
+                {"column": "total_amount", "type": "range", "min": -100, "max": 10000},
+                {"column": "PULocationID", "type": "range", "min": 1, "max": 265},
+                {"column": "DOLocationID", "type": "range", "min": 1, "max": 265},
+                {"column": "payment_type", "type": "accepted_values",
+                 "values": [1, 2, 3, 4, 5, 6]},
+            ],
+            format_checks=[
+                {"column": "store_and_fwd_flag", "pattern": r"^[YN]$"},
+            ],
+            latest_timestamp=get_latest_ts(yellow, "tpep_pickup_datetime"),
+            freshness_slo_days=90,
+        ))
+
+    # --- Green Tripdata ---
+    green_frames = []
+    for f in sorted(RAW_DIR.glob("green_tripdata_*.parquet")):
+        green_frames.append(pd.read_parquet(f))
+    green = pd.concat(green_frames, ignore_index=True) if green_frames else pd.DataFrame()
+
+    if not green.empty:
+        results.append(score_dataset(
+            name="green_tripdata",
+            df=green,
+            required_columns=["lpep_pickup_datetime", "lpep_dropoff_datetime",
+                              "PULocationID", "DOLocationID", "fare_amount",
+                              "total_amount", "trip_distance"],
+            key_columns=[],
+            validity_checks=[
+                {"column": "fare_amount", "type": "range", "min": -50, "max": 5000},
+                {"column": "trip_distance", "type": "range", "min": 0, "max": 500},
+                {"column": "passenger_count", "type": "range", "min": 0, "max": 9},
+                {"column": "PULocationID", "type": "range", "min": 1, "max": 265},
+                {"column": "DOLocationID", "type": "range", "min": 1, "max": 265},
+                {"column": "payment_type", "type": "accepted_values",
+                 "values": [1, 2, 3, 4, 5, 6]},
+            ],
+            format_checks=[
+                {"column": "store_and_fwd_flag", "pattern": r"^[YN]$"},
+            ],
+            latest_timestamp=get_latest_ts(green, "lpep_pickup_datetime"),
+            freshness_slo_days=90,
+        ))
+
+    # --- Taxi Zone Lookup ---
+    zones = pd.read_csv(RAW_DIR / "taxi_zone_lookup.csv")
     results.append(score_dataset(
-        name="users",
-        df=users,
-        required_columns=["user_id", "name", "email", "country", "platform",
-                          "signup_date", "subscription_type"],
-        key_columns=["user_id", "email"],
+        name="taxi_zone_lookup",
+        df=zones,
+        required_columns=["LocationID", "Borough", "Zone", "service_zone"],
+        key_columns=["LocationID"],
         validity_checks=[
-            {"column": "age", "type": "range", "min": 13, "max": 120},
-            {"column": "subscription_type", "type": "accepted_values",
-             "values": ["free", "premium", "premium_annual", "trial"]},
-            {"column": "platform", "type": "accepted_values",
-             "values": ["ios", "android", "web", "car_play", "smart_speaker"]},
+            {"column": "LocationID", "type": "range", "min": 1, "max": 265},
+            {"column": "Borough", "type": "accepted_values",
+             "values": ["Manhattan", "Bronx", "Brooklyn", "Queens",
+                        "Staten Island", "EWR", "Unknown"]},
         ],
-        format_checks=[
-            {"column": "signup_date", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
-            {"column": "gender", "pattern": r"^(m|f|male|female)$"},
-            {"column": "user_id", "pattern": r"^usr_\d{6}$"},
-        ],
-        latest_timestamp=get_latest_ts(users, "signup_date"),
-        freshness_slo_hours=168,
+        format_checks=[],
+        latest_timestamp=datetime.now(),  # reference data, always "fresh"
+        freshness_slo_days=365,
     ))
 
-    # --- CDN Logs ---
-    cdn = pd.read_csv(RAW_DIR / "cdn_logs.csv")
+    # --- Vendors ---
+    vendors = pd.read_csv(RAW_DIR / "vendors.csv")
     results.append(score_dataset(
-        name="cdn_logs",
-        df=cdn,
-        required_columns=["log_id", "event_id", "user_id", "timestamp", "cdn_node",
-                          "bytes_transferred"],
-        key_columns=["log_id"],
-        validity_checks=[
-            {"column": "startup_time_ms", "type": "range", "min": 0},
-            {"column": "bytes_transferred", "type": "range", "min": 1},
-            {"column": "rebuffer_ratio", "type": "range", "min": 0.0, "max": 1.0},
-            {"column": "bitrate", "type": "accepted_values",
-             "values": ["64kbps", "128kbps", "256kbps", "320kbps"]},
-        ],
-        format_checks=[
-            {"column": "timestamp",
-             "pattern": r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"},
-        ],
-        latest_timestamp=get_latest_ts(cdn, "timestamp"),
-        freshness_slo_hours=24,
-    ))
-
-    # --- Podcasts ---
-    podcasts = pd.DataFrame(json.loads((RAW_DIR / "podcasts.json").read_text()))
-    results.append(score_dataset(
-        name="podcasts",
-        df=podcasts,
-        required_columns=["podcast_id", "name", "category", "language", "host"],
-        key_columns=["podcast_id"],
+        name="vendors",
+        df=vendors,
+        required_columns=["vendor_id", "vendor_name"],
+        key_columns=["vendor_id"],
         validity_checks=[],
-        format_checks=[
-            {"column": "podcast_id", "pattern": r"^pod_\d{3}$"},
-        ],
-        latest_timestamp=get_latest_ts(podcasts, "created_at"),
-        freshness_slo_hours=720,
+        format_checks=[],
+        latest_timestamp=datetime.now(),
+        freshness_slo_days=365,
     ))
 
-    # --- Episodes ---
-    episodes = pd.DataFrame(json.loads((RAW_DIR / "episodes.json").read_text()))
+    # --- Payment Types ---
+    payment_types = pd.read_csv(RAW_DIR / "payment_types.csv")
     results.append(score_dataset(
-        name="episodes",
-        df=episodes,
-        required_columns=["episode_id", "podcast_id", "title", "published_at",
-                          "duration_seconds"],
-        key_columns=["episode_id"],
-        validity_checks=[
-            {"column": "duration_seconds", "type": "range", "min": 1},
-        ],
-        format_checks=[
-            {"column": "episode_id", "pattern": r"^ep_\d{4}$"},
-        ],
-        latest_timestamp=get_latest_ts(episodes, "published_at"),
-        freshness_slo_hours=168,
+        name="payment_types",
+        df=payment_types,
+        required_columns=["payment_type_id", "payment_type_name"],
+        key_columns=["payment_type_id"],
+        validity_checks=[],
+        format_checks=[],
+        latest_timestamp=datetime.now(),
+        freshness_slo_days=365,
     ))
 
-    # --- Ad Events ---
-    ad_events = pd.DataFrame(json.loads((RAW_DIR / "ad_events.json").read_text()))
+    # --- Rate Codes ---
+    rate_codes = pd.read_csv(RAW_DIR / "rate_codes.csv")
     results.append(score_dataset(
-        name="ad_events",
-        df=ad_events,
-        required_columns=["ad_event_id", "event_id", "user_id", "timestamp",
-                          "ad_type", "action", "advertiser", "campaign_id"],
-        key_columns=["ad_event_id"],
-        validity_checks=[
-            {"column": "revenue_sar", "type": "range", "min": 0},
-            {"column": "duration_seconds", "type": "range", "min": 1},
-            {"column": "ad_type", "type": "accepted_values",
-             "values": ["pre_roll", "mid_roll", "post_roll"]},
-            {"column": "action", "type": "accepted_values",
-             "values": ["impression", "click", "skip", "complete"]},
-        ],
-        format_checks=[
-            {"column": "timestamp",
-             "pattern": r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"},
-        ],
-        latest_timestamp=get_latest_ts(ad_events, "timestamp"),
-        freshness_slo_hours=48,
-    ))
-
-    # --- Listening Events (sample for speed) ---
-    events_dir = RAW_DIR / "listening_events"
-    # Load a sample of recent partition files
-    partition_files = sorted(events_dir.glob("events_*.jsonl"))
-    sample_files = partition_files[-30:] if len(partition_files) > 30 else partition_files
-    frames = []
-    for f in sample_files:
-        lines = f.read_text().strip().split("\n")
-        records = [json.loads(line) for line in lines if line.strip()]
-        if records:
-            frames.append(pd.DataFrame(records))
-    events_sample = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-    latest_partition = None
-    if partition_files:
-        date_str = partition_files[-1].stem.replace("events_", "")
-        try:
-            latest_partition = datetime.strptime(date_str, "%Y-%m-%d")
-        except Exception:
-            pass
-
-    results.append(score_dataset(
-        name="listening_events",
-        df=events_sample,
-        required_columns=["event_id", "user_id", "episode_id", "event_type",
-                          "timestamp", "listened_seconds"],
-        key_columns=["event_id"],
-        validity_checks=[
-            {"column": "listened_seconds", "type": "range", "min": 0, "max": 36000},
-            {"column": "event_type", "type": "accepted_values",
-             "values": ["play", "pause", "seek", "complete", "skip"]},
-            {"column": "platform", "type": "accepted_values",
-             "values": ["ios", "android", "web", "car_play", "smart_speaker"]},
-        ],
-        format_checks=[
-            {"column": "timestamp",
-             "pattern": r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"},
-            {"column": "event_id",
-             "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
-        ],
-        latest_timestamp=latest_partition,
-        freshness_slo_hours=24,
+        name="rate_codes",
+        df=rate_codes,
+        required_columns=["rate_code_id", "rate_code_name"],
+        key_columns=["rate_code_id"],
+        validity_checks=[],
+        format_checks=[],
+        latest_timestamp=datetime.now(),
+        freshness_slo_days=365,
     ))
 
     # Print scorecard

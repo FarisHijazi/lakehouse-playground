@@ -1,12 +1,13 @@
 """
 Exercise 5: Volume Anomaly Detection
 ======================================
-Counts daily listening events and flags anomalous days using:
-  - Rolling average with standard deviation bands (2-sigma)
-  - Day-over-day percentage change (>50% drop/spike)
-  - Week-over-week comparison (same weekday)
+Counts monthly taxi trips and flags anomalous months using:
+  - Rolling average with standard deviation bands
+  - Month-over-month percentage change (>50% drop/spike)
+  - Comparison of yellow vs green trip volumes
 """
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -15,124 +16,140 @@ DATA_DIR = Path(__file__).parent.parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 
 
-def count_events_per_partition(events_dir: Path) -> pd.DataFrame:
-    """Count lines in each partition file to get daily event counts."""
+def count_trips_per_file(raw_dir: Path, prefix: str) -> pd.DataFrame:
+    """Count rows in each monthly parquet file to get trip counts."""
     records = []
-    for f in sorted(events_dir.glob("events_*.jsonl")):
-        date_str = f.stem.replace("events_", "")
-        line_count = sum(1 for line in f.open() if line.strip())
-        records.append({"date": date_str, "event_count": line_count})
+    pattern = re.compile(rf"{prefix}_(\d{{4}}-\d{{2}})\.parquet")
+    for f in sorted(raw_dir.glob(f"{prefix}_*.parquet")):
+        match = pattern.match(f.name)
+        if match:
+            month_str = match.group(1)
+            row_count = len(pd.read_parquet(f))
+            records.append({"month": month_str, "trip_count": row_count})
     df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    if not df.empty:
+        df["month"] = pd.to_datetime(df["month"])
+        df = df.sort_values("month").reset_index(drop=True)
     return df
 
 
-def detect_anomalies(daily: pd.DataFrame) -> pd.DataFrame:
+def detect_anomalies(monthly: pd.DataFrame) -> pd.DataFrame:
     """Add anomaly detection columns."""
-    df = daily.copy()
+    df = monthly.copy()
 
-    # Rolling 7-day statistics
-    df["rolling_mean_7d"] = df["event_count"].rolling(window=7, min_periods=3).mean()
-    df["rolling_std_7d"] = df["event_count"].rolling(window=7, min_periods=3).std()
-    df["upper_2sigma"] = df["rolling_mean_7d"] + 2 * df["rolling_std_7d"]
-    df["lower_2sigma"] = df["rolling_mean_7d"] - 2 * df["rolling_std_7d"]
-    df["lower_2sigma"] = df["lower_2sigma"].clip(lower=0)
+    if len(df) < 2:
+        df["rolling_mean"] = df["trip_count"].astype(float)
+        df["rolling_std"] = 0.0
+        df["upper_2sigma"] = df["trip_count"].astype(float)
+        df["lower_2sigma"] = 0.0
+        df["sigma_anomaly"] = False
+        df["prev_month_count"] = None
+        df["mom_pct_change"] = None
+        df["mom_anomaly"] = False
+        df["is_anomaly"] = False
+        return df
+
+    # Rolling statistics (use min_periods=2 for small datasets)
+    window = min(3, len(df))
+    df["rolling_mean"] = df["trip_count"].rolling(window=window, min_periods=2).mean()
+    df["rolling_std"] = df["trip_count"].rolling(window=window, min_periods=2).std()
+    df["upper_2sigma"] = df["rolling_mean"] + 2 * df["rolling_std"]
+    df["lower_2sigma"] = (df["rolling_mean"] - 2 * df["rolling_std"]).clip(lower=0)
 
     # Sigma anomaly
     df["sigma_anomaly"] = (
-        (df["event_count"] > df["upper_2sigma"]) |
-        (df["event_count"] < df["lower_2sigma"])
+        (df["trip_count"] > df["upper_2sigma"]) |
+        (df["trip_count"] < df["lower_2sigma"])
     )
 
-    # Day-over-day percentage change
-    df["prev_day_count"] = df["event_count"].shift(1)
-    df["dod_pct_change"] = (
-        (df["event_count"] - df["prev_day_count"]).abs() /
-        df["prev_day_count"] * 100
+    # Month-over-month percentage change
+    df["prev_month_count"] = df["trip_count"].shift(1)
+    df["mom_pct_change"] = (
+        (df["trip_count"] - df["prev_month_count"]).abs() /
+        df["prev_month_count"] * 100
     )
-    df["dod_anomaly"] = df["dod_pct_change"] > 50.0
-
-    # Week-over-week (same weekday comparison)
-    df["same_weekday_last_week"] = df["event_count"].shift(7)
-    df["wow_pct_change"] = (
-        (df["event_count"] - df["same_weekday_last_week"]).abs() /
-        df["same_weekday_last_week"] * 100
-    )
-    df["wow_anomaly"] = df["wow_pct_change"] > 50.0
+    df["mom_anomaly"] = df["mom_pct_change"] > 50.0
 
     # Combined anomaly flag
-    df["is_anomaly"] = df["sigma_anomaly"] | df["dod_anomaly"]
+    df["is_anomaly"] = df["sigma_anomaly"] | df["mom_anomaly"]
 
     return df
 
 
 def main():
-    events_dir = RAW_DIR / "listening_events"
-    print("Counting events per partition...")
-    daily = count_events_per_partition(events_dir)
+    print("Counting trips per monthly file...")
+
+    # Yellow trips
+    yellow_monthly = count_trips_per_file(RAW_DIR, "yellow_tripdata")
 
     print(f"\n{'=' * 100}")
     print("  VOLUME ANOMALY DETECTION REPORT")
     print(f"{'=' * 100}")
-    print(f"  Total partitions: {len(daily)}")
-    print(f"  Date range: {daily['date'].min().date()} to {daily['date'].max().date()}")
-    print(f"  Total events: {daily['event_count'].sum():,}")
-    print(f"  Daily average: {daily['event_count'].mean():.1f}")
-    print(f"  Daily std dev: {daily['event_count'].std():.1f}")
-    print(f"  Daily min: {daily['event_count'].min()}")
-    print(f"  Daily max: {daily['event_count'].max()}")
 
-    df = detect_anomalies(daily)
+    if not yellow_monthly.empty:
+        print(f"\n  --- Yellow Tripdata ---")
+        print(f"  Total files: {len(yellow_monthly)}")
+        print(f"  Month range: {yellow_monthly['month'].min().date()} to "
+              f"{yellow_monthly['month'].max().date()}")
+        print(f"  Total trips: {yellow_monthly['trip_count'].sum():,}")
+        print(f"  Monthly average: {yellow_monthly['trip_count'].mean():,.0f}")
+        print(f"  Monthly std dev: {yellow_monthly['trip_count'].std():,.0f}"
+              if len(yellow_monthly) > 1 else "")
+        print(f"  Monthly min: {yellow_monthly['trip_count'].min():,}")
+        print(f"  Monthly max: {yellow_monthly['trip_count'].max():,}")
 
-    # Show anomalous days
-    anomalies = df[df["is_anomaly"]].copy()
-    print(f"\n  --- Anomalous Days ({len(anomalies)} found) ---")
-    if not anomalies.empty:
-        print(f"\n  {'Date':<14s} {'Count':>8s} {'Rolling Mean':>14s} "
-              f"{'Lower':>10s} {'Upper':>10s} {'DoD %':>8s} {'Reason'}")
+        yellow_df = detect_anomalies(yellow_monthly)
+
+        # Show all months with stats
+        print(f"\n  {'Month':<14s} {'Count':>12s} {'Rolling Mean':>14s} "
+              f"{'Lower':>12s} {'Upper':>12s} {'MoM %':>8s} {'Anomaly'}")
         print(f"  {'-' * 90}")
-        for _, row in anomalies.iterrows():
-            reasons = []
-            if row.get("sigma_anomaly"):
-                reasons.append("2-sigma")
-            if row.get("dod_anomaly"):
-                reasons.append(f"DoD>{row['dod_pct_change']:.0f}%")
-            reason_str = ", ".join(reasons)
-            print(f"  {str(row['date'].date()):<14s} {row['event_count']:>8,} "
-                  f"{row['rolling_mean_7d']:>14.1f} "
-                  f"{row['lower_2sigma']:>10.1f} {row['upper_2sigma']:>10.1f} "
-                  f"{row.get('dod_pct_change', 0):>8.1f} {reason_str}")
-    else:
-        print("  No anomalies detected.")
+        for _, row in yellow_df.iterrows():
+            anomaly_str = ""
+            if row.get("is_anomaly"):
+                reasons = []
+                if row.get("sigma_anomaly"):
+                    reasons.append("2-sigma")
+                if row.get("mom_anomaly"):
+                    reasons.append(f"MoM>{row['mom_pct_change']:.0f}%")
+                anomaly_str = ", ".join(reasons)
+            rm = row['rolling_mean']
+            ls = row['lower_2sigma']
+            us = row['upper_2sigma']
+            mc = row.get('mom_pct_change', 0)
+            print(f"  {str(row['month'].date()):<14s} {row['trip_count']:>12,} "
+                  f"{rm:>14,.0f} " if pd.notna(rm) else f"  {str(row['month'].date()):<14s} {row['trip_count']:>12,} {'N/A':>14s} ",
+                  end="")
+            print(f"{ls:>12,.0f} {us:>12,.0f} " if pd.notna(ls) else f"{'N/A':>12s} {'N/A':>12s} ", end="")
+            print(f"{mc:>8.1f} " if pd.notna(mc) else f"{'N/A':>8s} ", end="")
+            print(anomaly_str)
 
-    # Week-over-week anomalies
-    wow_anomalies = df[df["wow_anomaly"]].copy()
-    print(f"\n  --- Week-over-Week Anomalies ({len(wow_anomalies)} found) ---")
-    if not wow_anomalies.empty:
-        print(f"\n  {'Date':<14s} {'Count':>8s} {'Same Day Last Wk':>18s} {'WoW %':>8s}")
-        print(f"  {'-' * 55}")
-        for _, row in wow_anomalies.head(20).iterrows():
-            print(f"  {str(row['date'].date()):<14s} {row['event_count']:>8,} "
-                  f"{row['same_weekday_last_week']:>18.0f} "
-                  f"{row['wow_pct_change']:>8.1f}")
-        if len(wow_anomalies) > 20:
-            print(f"  ... and {len(wow_anomalies) - 20} more")
-    else:
-        print("  No week-over-week anomalies detected.")
+        # Show anomalies
+        anomalies = yellow_df[yellow_df["is_anomaly"]]
+        if not anomalies.empty:
+            print(f"\n  Anomalous months: {len(anomalies)}")
+        else:
+            print(f"\n  No anomalies detected in yellow trip volumes.")
 
-    # Day-of-week summary
-    df["weekday"] = df["date"].dt.day_name()
-    weekday_stats = df.groupby("weekday")["event_count"].agg(["mean", "std", "min", "max"])
-    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    weekday_stats = weekday_stats.reindex(day_order)
+    # Green trips
+    green_monthly = count_trips_per_file(RAW_DIR, "green_tripdata")
+    if not green_monthly.empty:
+        print(f"\n  --- Green Tripdata ---")
+        print(f"  Total files: {len(green_monthly)}")
+        print(f"  Total trips: {green_monthly['trip_count'].sum():,}")
+        print(f"  Monthly average: {green_monthly['trip_count'].mean():,.0f}")
 
-    print(f"\n  --- Day-of-Week Statistics ---")
-    print(f"  {'Day':<12s} {'Mean':>8s} {'Std':>8s} {'Min':>8s} {'Max':>8s}")
-    print(f"  {'-' * 48}")
-    for day, row in weekday_stats.iterrows():
-        print(f"  {day:<12s} {row['mean']:>8.1f} {row['std']:>8.1f} "
-              f"{row['min']:>8.0f} {row['max']:>8.0f}")
+        for _, row in green_monthly.iterrows():
+            print(f"    {row['month'].date()}: {row['trip_count']:,} trips")
+
+    # Cross-dataset comparison
+    if not yellow_monthly.empty and not green_monthly.empty:
+        print(f"\n  --- Yellow vs Green Comparison ---")
+        merged = yellow_monthly.merge(green_monthly, on="month", suffixes=("_yellow", "_green"))
+        for _, row in merged.iterrows():
+            ratio = row["trip_count_yellow"] / row["trip_count_green"] if row["trip_count_green"] > 0 else float("inf")
+            print(f"    {row['month'].date()}: yellow={row['trip_count_yellow']:,}, "
+                  f"green={row['trip_count_green']:,}, ratio={ratio:.1f}x")
 
     print(f"\n{'=' * 100}")
     print("  VOLUME ANOMALY DETECTION COMPLETE")
