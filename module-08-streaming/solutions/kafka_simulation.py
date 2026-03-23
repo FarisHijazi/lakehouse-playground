@@ -10,10 +10,12 @@ Full simulation of Kafka concepts using Python threading and queues:
 - Rebalancing demonstration
 
 This teaches you Kafka internals without requiring a Kafka installation.
+The simulation uses NYC yellow taxi trip events as the data domain.
 """
 
 import hashlib
 import json
+import random
 import threading
 import time
 from collections import defaultdict
@@ -139,13 +141,13 @@ class ConsumerGroup:
     def add_consumer(self, consumer: Consumer):
         """Add a consumer and trigger rebalance."""
         self.consumers.append(consumer)
-        print(f"  [ConsumerGroup] Consumer '{consumer.consumer_id}' joined → rebalancing...")
+        print(f"  [ConsumerGroup] Consumer '{consumer.consumer_id}' joined -> rebalancing...")
         self._rebalance()
 
     def remove_consumer(self, consumer: Consumer):
         """Remove a consumer and trigger rebalance."""
         self.consumers.remove(consumer)
-        print(f"  [ConsumerGroup] Consumer '{consumer.consumer_id}' left → rebalancing...")
+        print(f"  [ConsumerGroup] Consumer '{consumer.consumer_id}' left -> rebalancing...")
         self._rebalance()
 
     def _rebalance(self):
@@ -174,40 +176,63 @@ class ConsumerGroup:
         # Print new assignments
         for consumer in self.consumers:
             pids = list(consumer.assigned_partitions.keys())
-            print(f"    [{consumer.consumer_id}] → partitions {pids}")
+            print(f"    [{consumer.consumer_id}] -> partitions {pids}")
 
 
 # ========================================
 # Demo: Full Kafka Simulation
 # ========================================
 
+def generate_taxi_trip(trip_id: int, vendor_id: int) -> dict:
+    """Generate a simulated taxi trip event."""
+    # Sample realistic pickup/dropoff zones (Manhattan-heavy)
+    manhattan_zones = [79, 107, 170, 186, 234, 236, 237, 161, 162, 163, 164, 48, 50, 68]
+    airport_zones = [132, 138, 1]  # JFK, LaGuardia, Newark
+    all_zones = manhattan_zones + airport_zones
+
+    pu_zone = random.choice(all_zones)
+    do_zone = random.choice(all_zones)
+    distance = round(random.uniform(0.5, 25.0), 2)
+    fare = round(2.50 + distance * 2.50 + random.uniform(0, 5), 2)
+    tip = round(fare * random.uniform(0, 0.30), 2) if random.random() > 0.3 else 0
+    payment = random.choice([1, 1, 1, 2, 2, 3])  # credit card weighted
+
+    return {
+        "trip_id": f"trip_{trip_id:06d}",
+        "vendor_id": vendor_id,
+        "pu_location_id": pu_zone,
+        "do_location_id": do_zone,
+        "trip_distance": distance,
+        "fare_amount": fare,
+        "tip_amount": tip,
+        "payment_type": payment,
+        "pickup_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def run_kafka_simulation():
     print("=" * 60)
-    print("Kafka Simulation Demo")
+    print("Kafka Simulation Demo: NYC Taxi Trip Streaming")
     print("=" * 60)
 
     # 1. Create a topic with 4 partitions
     print("\n--- Step 1: Create Topic ---")
-    topic = Topic("listening_events", num_partitions=4)
+    topic = Topic("taxi_trips", num_partitions=4)
 
     # 2. Create a producer
     print("\n--- Step 2: Produce Messages ---")
     producer = Producer(topic)
 
-    # Produce some events, keyed by user_id
-    users = ["usr_000001", "usr_000002", "usr_000003", "usr_000004", "usr_000005"]
+    # Produce taxi trip events, keyed by pickup zone (ensures all trips from
+    # the same zone go to the same partition -- useful for zone-level aggregations)
+    vendors = [1, 2]
     for i in range(20):
-        user = users[i % len(users)]
-        event = {
-            "event_id": f"evt_{i:04d}",
-            "user_id": user,
-            "event_type": "play",
-            "episode_id": f"ep_{(i % 3) + 1:04d}",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        pid, offset = producer.send(key=user, value=event)
+        vendor = random.choice(vendors)
+        trip = generate_taxi_trip(trip_id=i, vendor_id=vendor)
+        key = str(trip["pu_location_id"])
+        pid, offset = producer.send(key=key, value=trip)
         if i < 5:
-            print(f"  Sent event {event['event_id']} → partition {pid}, offset {offset}")
+            print(f"  Sent trip {trip['trip_id']} (zone {key}) -> partition {pid}, offset {offset}")
 
     print(f"  ... sent {producer.messages_sent} messages total")
 
@@ -218,7 +243,7 @@ def run_kafka_simulation():
 
     # 3. Create consumer group with 2 consumers
     print("\n--- Step 3: Consumer Group (2 consumers) ---")
-    group = ConsumerGroup("analytics_group", topic)
+    group = ConsumerGroup("trip_analytics_group", topic)
 
     consumer_a = Consumer("consumer-A")
     consumer_b = Consumer("consumer-B")
@@ -237,7 +262,8 @@ def run_kafka_simulation():
     if msgs_a:
         print(f"\n  Consumer A sample (from partitions {list(consumer_a.assigned_partitions.keys())}):")
         for msg in msgs_a[:3]:
-            print(f"    partition={msg['partition']}, offset={msg['offset']}, user={msg['value']['user_id']}")
+            print(f"    partition={msg['partition']}, offset={msg['offset']}, "
+                  f"zone={msg['value']['pu_location_id']}, fare=${msg['value']['fare_amount']}")
 
     # 5. Demonstrate rebalancing
     print("\n--- Step 5: Rebalancing (add consumer C) ---")
@@ -247,8 +273,9 @@ def run_kafka_simulation():
     # 6. Produce more messages and consume
     print("\n--- Step 6: Produce more, consume with 3 consumers ---")
     for i in range(12):
-        user = users[i % len(users)]
-        producer.send(key=user, value={"event_id": f"evt_{20+i:04d}", "user_id": user, "event_type": "play"})
+        vendor = random.choice(vendors)
+        trip = generate_taxi_trip(trip_id=20 + i, vendor_id=vendor)
+        producer.send(key=str(trip["pu_location_id"]), value=trip)
 
     msgs_a2 = consumer_a.poll(max_records=100)
     msgs_b2 = consumer_b.poll(max_records=100)
@@ -260,7 +287,7 @@ def run_kafka_simulation():
     # 7. Demonstrate independent consumer groups
     print("\n--- Step 7: Independent Consumer Groups ---")
     print("  Creating a second consumer group (same topic)...")
-    group2 = ConsumerGroup("dashboard_group", topic)
+    group2 = ConsumerGroup("fare_dashboard_group", topic)
     dashboard_consumer = Consumer("dashboard-1")
     group2.add_consumer(dashboard_consumer)
 
@@ -272,14 +299,15 @@ def run_kafka_simulation():
 
     # 8. Show key-based ordering guarantee
     print("\n--- Step 8: Ordering Guarantee ---")
-    print("  Same key always goes to same partition → ordered per user:")
-    for user in users[:3]:
-        pid = topic.get_partition_for_key(user)
-        print(f"    {user} → always partition {pid}")
+    print("  Same pickup zone always goes to same partition -> ordered per zone:")
+    sample_zones = ["132", "138", "79", "170", "236"]
+    for zone in sample_zones:
+        pid = topic.get_partition_for_key(zone)
+        print(f"    Zone {zone} -> always partition {pid}")
 
     print("\nDone! This simulation covers:")
     print("  - Topics and partitions")
-    print("  - Key-based partitioning (ordering guarantee)")
+    print("  - Key-based partitioning (ordering guarantee per pickup zone)")
     print("  - Consumer groups and partition assignment")
     print("  - Rebalancing when consumers join/leave")
     print("  - Independent consumer groups reading same topic")

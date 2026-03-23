@@ -7,323 +7,309 @@
 
 
 -- =============================================================================
--- Exercise 3a: Top 10 Episodes by Total Listen Time
+-- Exercise 3a: Revenue by Borough
 -- =============================================================================
--- Join listening_events to episodes and podcasts to get human-readable names.
--- SUM(listened_seconds) gives total engagement; COUNT(DISTINCT user_id) gives reach.
+-- Join yellow_taxi_trips to taxi_zones to get borough names.
+-- SUM(total_amount) gives total revenue; COUNT(*) gives trip volume.
 
 SELECT
-    p.name_en                           AS podcast_name,
-    e.title                             AS episode_title,
-    SUM(le.listened_seconds)            AS total_listened_seconds,
-    COUNT(DISTINCT le.user_id)          AS listener_count
-FROM listening_events le
-JOIN episodes e ON e.episode_id = le.episode_id
-JOIN podcasts p ON p.podcast_id = e.podcast_id
-GROUP BY p.name_en, e.title
-ORDER BY total_listened_seconds DESC
-LIMIT 10;
+    z.borough,
+    COUNT(*)                                AS total_trips,
+    ROUND(SUM(t.total_amount)::numeric, 2)  AS total_revenue,
+    ROUND(AVG(t.fare_amount)::numeric, 2)   AS avg_fare
+FROM yellow_taxi_trips t
+JOIN taxi_zones z ON z.location_id = t.pu_location_id
+GROUP BY z.borough
+ORDER BY total_revenue DESC;
 
 
 -- =============================================================================
--- Exercise 3b: Daily Active Listeners (DAL)
+-- Exercise 3b: Hourly Trip Patterns
 -- =============================================================================
--- Truncate timestamps to date, then count distinct users per day.
--- This is the most fundamental engagement metric.
+-- Extract the hour from the pickup timestamp, then compute average daily trips.
+-- This reveals peak demand hours for taxi operations.
 
 SELECT
-    DATE(event_timestamp)               AS day,
-    COUNT(DISTINCT user_id)             AS unique_listeners
-FROM listening_events
-GROUP BY DATE(event_timestamp)
-ORDER BY day;
+    EXTRACT(HOUR FROM tpep_pickup_datetime)   AS hour_of_day,
+    COUNT(*) / COUNT(DISTINCT DATE(tpep_pickup_datetime)) AS avg_daily_trips,
+    ROUND(AVG(fare_amount)::numeric, 2)       AS avg_fare,
+    ROUND(AVG(tip_amount)::numeric, 2)        AS avg_tip
+FROM yellow_taxi_trips
+GROUP BY EXTRACT(HOUR FROM tpep_pickup_datetime)
+ORDER BY hour_of_day;
 
 
 -- =============================================================================
--- Exercise 3c: User Retention - Week 1 vs Week 5
+-- Exercise 3c: Weather Impact on Taxi Demand
 -- =============================================================================
--- Cohort retention: compare early engagement to later engagement.
--- Uses CTEs for clarity -- each step is independently testable.
+-- Join trips to daily_weather by pickup date. Compare trip volume
+-- on rainy vs dry days, snow vs no snow, cold vs warm.
 
-WITH cohort AS (
-    -- Users who signed up in 2022
-    SELECT user_id, signup_date
-    FROM users
-    WHERE signup_date >= '2022-01-01'
-      AND signup_date < '2023-01-01'
-),
-week1_active AS (
-    -- Cohort members with at least one listen in their first 7 days
-    SELECT DISTINCT c.user_id
-    FROM cohort c
-    JOIN listening_events le ON le.user_id = c.user_id
-    WHERE le.event_timestamp >= c.signup_date
-      AND le.event_timestamp < c.signup_date + INTERVAL '7 days'
-),
-week5_active AS (
-    -- Cohort members with at least one listen in days 29-35
-    SELECT DISTINCT c.user_id
-    FROM cohort c
-    JOIN listening_events le ON le.user_id = c.user_id
-    WHERE le.event_timestamp >= c.signup_date + INTERVAL '28 days'
-      AND le.event_timestamp < c.signup_date + INTERVAL '35 days'
+WITH daily_trips AS (
+    SELECT
+        DATE(tpep_pickup_datetime)              AS trip_date,
+        COUNT(*)                                AS trip_count,
+        ROUND(AVG(fare_amount)::numeric, 2)     AS avg_fare
+    FROM yellow_taxi_trips
+    GROUP BY DATE(tpep_pickup_datetime)
 )
 SELECT
-    (SELECT COUNT(*) FROM cohort)        AS cohort_size,
-    (SELECT COUNT(*) FROM week1_active)  AS week1_listeners,
-    (SELECT COUNT(*) FROM week5_active)  AS week5_listeners,
-    ROUND(
-        100.0 * (SELECT COUNT(*) FROM week5_active) /
-        NULLIF((SELECT COUNT(*) FROM week1_active), 0),
-        2
-    )                                    AS retention_rate_pct;
+    CASE
+        WHEN w.precipitation_in > 0.1 THEN 'Rainy'
+        ELSE 'Dry'
+    END                                         AS weather_condition,
+    COUNT(*)                                    AS num_days,
+    ROUND(AVG(dt.trip_count)::numeric, 0)       AS avg_daily_trips,
+    ROUND(AVG(dt.avg_fare)::numeric, 2)         AS avg_fare
+FROM daily_trips dt
+JOIN daily_weather w ON w.date = dt.trip_date
+GROUP BY CASE WHEN w.precipitation_in > 0.1 THEN 'Rainy' ELSE 'Dry' END
+ORDER BY weather_condition;
 
 
 -- =============================================================================
--- Exercise 3d: Podcast Completion Rate
+-- Exercise 3d: Tipping Analysis by Payment Type
 -- =============================================================================
--- Completion rate = complete events / total events per podcast.
--- Also include average episode duration to check if shorter episodes complete more.
+-- Tip percentage = tip_amount / fare_amount. Join with payment_types for names.
+-- Cash tips are NOT recorded (show as $0) -- a classic data engineering gotcha.
 
 SELECT
-    p.name_en                                         AS podcast_name,
-    COUNT(*)                                          AS total_events,
-    COUNT(*) FILTER (WHERE le.event_type = 'complete') AS complete_events,
+    pt.payment_type_name,
+    COUNT(*)                                                    AS total_trips,
+    ROUND(AVG(t.tip_amount)::numeric, 2)                        AS avg_tip,
     ROUND(
-        100.0 * COUNT(*) FILTER (WHERE le.event_type = 'complete') / COUNT(*),
+        100.0 * AVG(
+            CASE WHEN t.fare_amount > 0 THEN t.tip_amount / t.fare_amount END
+        )::numeric,
         2
-    )                                                 AS completion_rate_pct,
-    ROUND(AVG(e.duration_seconds) / 60.0, 1)          AS avg_episode_minutes
-FROM listening_events le
-JOIN episodes e ON e.episode_id = le.episode_id
-JOIN podcasts p ON p.podcast_id = e.podcast_id
-GROUP BY p.name_en
-ORDER BY completion_rate_pct DESC;
+    )                                                           AS avg_tip_pct
+FROM yellow_taxi_trips t
+JOIN payment_types pt ON pt.payment_type_id = t.payment_type
+GROUP BY pt.payment_type_name
+ORDER BY avg_tip_pct DESC;
 
 
 -- =============================================================================
--- Exercise 3e: Revenue by Advertiser
+-- Exercise 3e: Airport Trip Analysis
 -- =============================================================================
--- Calculate ad performance metrics per advertiser.
--- CTR (click-through rate) is clicks/impressions -- the standard ad metric.
+-- Analyze trips to/from JFK (132), LaGuardia (138), and Newark (1).
+-- Compare average fares, distances, and tip amounts across airports.
 
 SELECT
-    advertiser,
-    ROUND(SUM(revenue_sar), 2)                        AS total_revenue_sar,
-    COUNT(*) FILTER (WHERE action = 'impression')     AS impressions,
-    COUNT(*) FILTER (WHERE action = 'click')          AS clicks,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE action = 'click') /
-        NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0),
-        2
-    )                                                 AS ctr_pct,
-    ROUND(
-        SUM(revenue_sar) /
-        NULLIF(COUNT(*) FILTER (WHERE action = 'impression'), 0),
-        4
-    )                                                 AS avg_revenue_per_impression
-FROM ad_events
-GROUP BY advertiser
-ORDER BY total_revenue_sar DESC;
+    z.zone                                          AS airport,
+    COUNT(*) FILTER (WHERE t.pu_location_id = z.location_id) AS pickups,
+    COUNT(*) FILTER (WHERE t.do_location_id = z.location_id) AS dropoffs,
+    ROUND(AVG(t.fare_amount)::numeric, 2)           AS avg_fare,
+    ROUND(AVG(t.tip_amount)::numeric, 2)            AS avg_tip,
+    ROUND(AVG(t.total_amount)::numeric, 2)          AS avg_total,
+    ROUND(AVG(t.trip_distance)::numeric, 2)         AS avg_distance
+FROM yellow_taxi_trips t
+JOIN taxi_zones z ON z.location_id IN (1, 132, 138)
+    AND (t.pu_location_id = z.location_id OR t.do_location_id = z.location_id)
+GROUP BY z.zone, z.location_id
+ORDER BY pickups DESC;
 
 
 -- =============================================================================
--- Exercise 3f: Platform Distribution Over Time
+-- Exercise 3f: Uber vs Lyft Comparison
 -- =============================================================================
--- Use DATE_TRUNC to bucket by quarter, then FILTER to count per platform.
--- The percentage calculation shows platform mix shift over time.
+-- Using fhv_trips, compare Uber (HV0003) vs Lyft (HV0005) on key metrics.
+-- Shared ride percentage shows platform strategy differences.
 
 SELECT
-    TO_CHAR(DATE_TRUNC('quarter', event_timestamp), 'YYYY-"Q"Q') AS quarter,
-    COUNT(*)                                                       AS total_events,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE platform = 'ios')       / COUNT(*), 1) AS ios_pct,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE platform = 'android')   / COUNT(*), 1) AS android_pct,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE platform = 'web')       / COUNT(*), 1) AS web_pct,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE platform = 'car_play')  / COUNT(*), 1) AS car_play_pct,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE platform = 'smart_speaker') / COUNT(*), 1) AS smart_speaker_pct
-FROM listening_events
-GROUP BY DATE_TRUNC('quarter', event_timestamp)
-ORDER BY quarter;
+    b.app_company,
+    COUNT(*)                                                AS total_trips,
+    ROUND(AVG(f.trip_miles)::numeric, 2)                    AS avg_miles,
+    ROUND(AVG(f.trip_time / 60.0)::numeric, 1)             AS avg_minutes,
+    ROUND(AVG(f.base_passenger_fare)::numeric, 2)           AS avg_passenger_fare,
+    ROUND(AVG(f.tips)::numeric, 2)                          AS avg_tips,
+    ROUND(AVG(f.driver_pay)::numeric, 2)                    AS avg_driver_pay,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE f.shared_request_flag = 'Y') / COUNT(*),
+        2
+    )                                                       AS shared_ride_pct
+FROM fhv_trips f
+JOIN fhv_bases b ON b.base_license_num = f.hvfhs_license_num
+WHERE f.hvfhs_license_num IN ('HV0003', 'HV0005')
+GROUP BY b.app_company
+ORDER BY total_trips DESC;
 
 
 -- =============================================================================
 -- Exercise 4c: Composite Index for Dashboard Query
 -- =============================================================================
--- The query filters on event_type and event_timestamp, then groups by episode_id.
--- A composite index on (event_type, event_timestamp) helps the WHERE clause.
--- Including episode_id enables an index-only scan for the GROUP BY.
+-- The query filters on pickup datetime and payment_type, then groups by location.
+-- A composite index on (tpep_pickup_datetime, payment_type) helps the WHERE clause.
+-- Including pu_location_id enables an index-only scan for the GROUP BY.
 
-CREATE INDEX idx_events_type_timestamp_episode
-    ON listening_events(event_type, event_timestamp, episode_id);
+CREATE INDEX idx_yellow_dt_payment_location
+    ON yellow_taxi_trips(tpep_pickup_datetime, payment_type, pu_location_id);
 
 -- Verify with:
 -- EXPLAIN ANALYZE
--- SELECT episode_id, COUNT(*) as plays, SUM(listened_seconds) as total_seconds
--- FROM listening_events
--- WHERE event_type = 'play'
---   AND event_timestamp >= '2023-06-01'
---   AND event_timestamp < '2023-07-01'
--- GROUP BY episode_id
--- ORDER BY total_seconds DESC
+-- SELECT pu_location_id, COUNT(*) as trips, SUM(total_amount) as revenue
+-- FROM yellow_taxi_trips
+-- WHERE tpep_pickup_datetime >= '2023-01-01'
+--   AND tpep_pickup_datetime < '2023-02-01'
+--   AND payment_type = 1
+-- GROUP BY pu_location_id
+-- ORDER BY revenue DESC
 -- LIMIT 20;
 
 
 -- =============================================================================
--- Exercise 5a: Podcast Performance Dashboard View
+-- Exercise 5a: Daily Trip Summary View
 -- =============================================================================
 
-CREATE OR REPLACE VIEW v_podcast_performance AS
-SELECT
-    p.podcast_id,
-    p.name                                             AS podcast_name_ar,
-    p.name_en                                          AS podcast_name_en,
-    p.category,
-    COUNT(DISTINCT e.episode_id)                       AS episode_count,
-    COUNT(le.event_id)                                 AS total_events,
-    ROUND(SUM(COALESCE(le.listened_seconds, 0)) / 3600.0, 1) AS total_listened_hours,
-    COUNT(DISTINCT le.user_id)                         AS unique_listeners,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE le.event_type = 'complete') /
-        NULLIF(COUNT(le.event_id), 0),
-        2
-    )                                                  AS completion_rate_pct,
-    MAX(e.published_at)                                AS most_recent_episode
-FROM podcasts p
-LEFT JOIN episodes e ON e.podcast_id = p.podcast_id
-LEFT JOIN listening_events le ON le.episode_id = e.episode_id
-GROUP BY p.podcast_id, p.name, p.name_en, p.category;
-
-
--- =============================================================================
--- Exercise 5b: Daily Metrics View
--- =============================================================================
-
-CREATE OR REPLACE VIEW v_daily_metrics AS
-WITH daily_listening AS (
+CREATE OR REPLACE VIEW v_daily_trip_summary AS
+WITH yellow_daily AS (
     SELECT
-        DATE(event_timestamp)              AS day,
-        COUNT(DISTINCT user_id)            AS unique_listeners,
-        COUNT(*)                           AS total_events,
-        ROUND(SUM(listened_seconds) / 3600.0, 1) AS listened_hours
-    FROM listening_events
-    GROUP BY DATE(event_timestamp)
+        DATE(tpep_pickup_datetime)               AS day,
+        COUNT(*)                                 AS trips,
+        SUM(total_amount)                        AS revenue,
+        AVG(fare_amount)                         AS avg_fare,
+        AVG(CASE WHEN payment_type = 1 AND fare_amount > 0
+            THEN tip_amount / fare_amount END)   AS avg_tip_pct,
+        AVG(trip_distance)                       AS avg_distance
+    FROM yellow_taxi_trips
+    GROUP BY DATE(tpep_pickup_datetime)
 ),
-daily_signups AS (
+green_daily AS (
     SELECT
-        signup_date                        AS day,
-        COUNT(*)                           AS new_users
-    FROM users
-    WHERE signup_date IS NOT NULL
-    GROUP BY signup_date
-),
-daily_revenue AS (
-    SELECT
-        DATE(ad_timestamp)                 AS day,
-        ROUND(SUM(revenue_sar), 2)         AS ad_revenue_sar
-    FROM ad_events
-    GROUP BY DATE(ad_timestamp)
+        DATE(lpep_pickup_datetime)               AS day,
+        COUNT(*)                                 AS trips,
+        SUM(total_amount)                        AS revenue,
+        AVG(fare_amount)                         AS avg_fare,
+        AVG(trip_distance)                       AS avg_distance
+    FROM green_taxi_trips
+    GROUP BY DATE(lpep_pickup_datetime)
 )
 SELECT
-    dl.day,
-    dl.unique_listeners,
-    dl.total_events,
-    dl.listened_hours,
-    COALESCE(ds.new_users, 0)              AS new_users,
-    COALESCE(dr.ad_revenue_sar, 0)         AS ad_revenue_sar
-FROM daily_listening dl
-LEFT JOIN daily_signups ds ON ds.day = dl.day
-LEFT JOIN daily_revenue dr ON dr.day = dl.day
-ORDER BY dl.day;
+    y.day,
+    COALESCE(y.trips, 0) + COALESCE(g.trips, 0)       AS total_trips,
+    ROUND((COALESCE(y.revenue, 0) + COALESCE(g.revenue, 0))::numeric, 2) AS total_revenue,
+    ROUND(y.avg_fare::numeric, 2)                       AS avg_yellow_fare,
+    ROUND((y.avg_tip_pct * 100)::numeric, 2)            AS avg_tip_pct_credit,
+    ROUND(y.avg_distance::numeric, 2)                   AS avg_distance
+FROM yellow_daily y
+LEFT JOIN green_daily g ON g.day = y.day
+ORDER BY y.day;
 
 
 -- =============================================================================
--- Exercise 5c: User Segments View
+-- Exercise 5b: Zone Performance View
 -- =============================================================================
--- Segments users by engagement in the last 90 days (relative to max date in data).
--- Finds each user's favorite podcast by listen count.
 
-CREATE OR REPLACE VIEW v_user_segments AS
-WITH data_boundary AS (
-    SELECT MAX(event_timestamp) AS max_ts FROM listening_events
-),
-user_activity AS (
+CREATE OR REPLACE VIEW v_zone_performance AS
+WITH zone_stats AS (
     SELECT
-        u.user_id,
-        u.name,
-        COUNT(le.event_id) FILTER (
-            WHERE le.event_timestamp >= (SELECT max_ts FROM data_boundary) - INTERVAL '90 days'
-        )                                              AS total_events_90d,
-        MAX(le.event_timestamp)                        AS last_listen_date
-    FROM users u
-    LEFT JOIN listening_events le ON le.user_id = u.user_id
-    GROUP BY u.user_id, u.name
+        pu_location_id                            AS location_id,
+        COUNT(*)                                  AS total_pickups,
+        ROUND(AVG(fare_amount)::numeric, 2)       AS avg_fare,
+        ROUND(AVG(tip_amount)::numeric, 2)        AS avg_tip,
+        ROUND(AVG(trip_distance)::numeric, 2)     AS avg_distance,
+        MODE() WITHIN GROUP (ORDER BY payment_type) AS most_common_payment_type
+    FROM yellow_taxi_trips
+    GROUP BY pu_location_id
 ),
-favorite_podcast AS (
-    -- For each user, find the podcast with the most listening events
-    SELECT DISTINCT ON (le.user_id)
-        le.user_id,
-        p.name_en                                      AS favorite_podcast
-    FROM listening_events le
-    JOIN episodes e ON e.episode_id = le.episode_id
-    JOIN podcasts p ON p.podcast_id = e.podcast_id
-    GROUP BY le.user_id, p.name_en
-    ORDER BY le.user_id, COUNT(*) DESC
+dropoff_stats AS (
+    SELECT
+        do_location_id                            AS location_id,
+        COUNT(*)                                  AS total_dropoffs
+    FROM yellow_taxi_trips
+    GROUP BY do_location_id
 )
 SELECT
-    ua.user_id,
-    ua.name,
+    z.borough,
+    z.zone,
+    zs.total_pickups,
+    COALESCE(ds.total_dropoffs, 0)                AS total_dropoffs,
+    zs.avg_fare,
+    zs.avg_tip,
+    pt.payment_type_name                          AS most_common_payment,
+    zs.avg_distance
+FROM zone_stats zs
+JOIN taxi_zones z ON z.location_id = zs.location_id
+LEFT JOIN dropoff_stats ds ON ds.location_id = zs.location_id
+LEFT JOIN payment_types pt ON pt.payment_type_id = zs.most_common_payment_type
+ORDER BY zs.total_pickups DESC;
+
+
+-- =============================================================================
+-- Exercise 5c: Hourly Demand View
+-- =============================================================================
+
+CREATE OR REPLACE VIEW v_hourly_demand AS
+SELECT
+    DATE(tpep_pickup_datetime)                                      AS day,
+    EXTRACT(HOUR FROM tpep_pickup_datetime)::int                    AS hour_of_day,
+    COUNT(*)                                                        AS trip_count,
+    ROUND(AVG(fare_amount)::numeric, 2)                             AS avg_fare,
+    CASE WHEN EXTRACT(DOW FROM tpep_pickup_datetime) IN (0, 6)
+         THEN 'weekend' ELSE 'weekday' END                         AS day_type,
     CASE
-        WHEN ua.total_events_90d >= 50 THEN 'Power User'
-        WHEN ua.total_events_90d >= 10 THEN 'Regular'
-        WHEN ua.total_events_90d >= 1  THEN 'Casual'
-        ELSE 'Dormant'
-    END                                                AS segment,
-    ua.total_events_90d,
-    ua.last_listen_date,
-    fp.favorite_podcast
-FROM user_activity ua
-LEFT JOIN favorite_podcast fp ON fp.user_id = ua.user_id;
+        WHEN EXTRACT(DOW FROM tpep_pickup_datetime) NOT IN (0, 6)
+             AND EXTRACT(HOUR FROM tpep_pickup_datetime) BETWEEN 7 AND 9
+        THEN true
+        WHEN EXTRACT(DOW FROM tpep_pickup_datetime) NOT IN (0, 6)
+             AND EXTRACT(HOUR FROM tpep_pickup_datetime) BETWEEN 16 AND 19
+        THEN true
+        ELSE false
+    END                                                             AS is_rush_hour
+FROM yellow_taxi_trips
+GROUP BY DATE(tpep_pickup_datetime),
+         EXTRACT(HOUR FROM tpep_pickup_datetime),
+         EXTRACT(DOW FROM tpep_pickup_datetime)
+ORDER BY day, hour_of_day;
 
 
 -- =============================================================================
--- Exercise 5d: CDN Health View
+-- Exercise 5d: Data Quality View
 -- =============================================================================
 
-CREATE OR REPLACE VIEW v_cdn_health AS
-WITH daily_cdn AS (
-    SELECT
-        DATE(log_timestamp)                                AS day,
-        COUNT(*)                                           AS total_requests,
-        COUNT(*) FILTER (WHERE error_type IS NOT NULL)     AS error_count,
-        ROUND(AVG(startup_time_ms), 0)                     AS avg_startup_ms,
-        ROUND(AVG(rebuffer_ratio)::numeric, 4)             AS avg_rebuffer_ratio,
-        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY startup_time_ms) AS p95_startup_ms
-    FROM cdn_logs
-    GROUP BY DATE(log_timestamp)
-),
-worst_node AS (
-    -- Per day, which CDN node had the highest error rate?
-    SELECT DISTINCT ON (DATE(log_timestamp))
-        DATE(log_timestamp)                                AS day,
-        cdn_node,
-        COUNT(*) FILTER (WHERE error_type IS NOT NULL)     AS node_errors,
-        COUNT(*)                                           AS node_total
-    FROM cdn_logs
-    GROUP BY DATE(log_timestamp), cdn_node
-    HAVING COUNT(*) >= 5  -- Minimum sample size to avoid noise
-    ORDER BY DATE(log_timestamp),
-             COUNT(*) FILTER (WHERE error_type IS NOT NULL)::float / COUNT(*) DESC
-)
+CREATE OR REPLACE VIEW v_data_quality_issues AS
 SELECT
-    dc.day,
-    dc.total_requests,
-    dc.error_count,
-    ROUND(100.0 * dc.error_count / dc.total_requests, 2)  AS error_rate_pct,
-    dc.avg_startup_ms,
-    dc.avg_rebuffer_ratio,
-    ROUND(dc.p95_startup_ms::numeric, 0)                   AS p95_startup_ms,
-    wn.cdn_node                                            AS worst_cdn_node,
-    wn.node_errors                                         AS worst_node_errors
-FROM daily_cdn dc
-LEFT JOIN worst_node wn ON wn.day = dc.day
-ORDER BY dc.day;
+    'negative_fare'           AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE fare_amount < 0
+
+UNION ALL
+
+SELECT
+    'zero_distance_with_fare' AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE trip_distance = 0 AND fare_amount > 10
+
+UNION ALL
+
+SELECT
+    'null_passenger_count'    AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE passenger_count IS NULL OR passenger_count = 0
+
+UNION ALL
+
+SELECT
+    'pickup_after_dropoff'    AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime > tpep_dropoff_datetime
+
+UNION ALL
+
+SELECT
+    'extreme_total_amount'    AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE total_amount > 500
+
+UNION ALL
+
+SELECT
+    'unknown_rate_code'       AS issue_type,
+    COUNT(*)                  AS issue_count
+FROM yellow_taxi_trips
+WHERE rate_code_id = 99;

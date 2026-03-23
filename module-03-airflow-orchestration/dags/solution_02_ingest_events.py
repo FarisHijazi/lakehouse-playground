@@ -1,20 +1,20 @@
 """
-Solution 02: Ingest Listening Events (Raw JSONL -> Bronze Parquet)
-==================================================================
-This DAG reads raw JSONL listening-event files and converts them to Parquet
-in the Bronze layer, partitioned by date.
+Solution 02: Ingest Yellow Taxi Trips (Raw Parquet -> Bronze Parquet)
+=====================================================================
+This DAG reads raw yellow taxi trip Parquet files and converts them to
+partitioned Bronze-layer Parquet, organized by year and month.
 
 Key patterns demonstrated:
   - Using {{ ds }} (logical date) to build file paths -> idempotent processing
-  - Partitioning output by date for efficient downstream queries
+  - Partitioning output by year/month for efficient downstream queries
   - Passing metadata (row counts) between tasks via XComs
   - Graceful handling of missing source files with AirflowSkipException
   - Overwriting output to guarantee idempotency (re-running produces same result)
 
 Data flow:
-  /opt/airflow/data/raw/listening_events/events_YYYY-MM-DD.jsonl
+  /opt/airflow/data/raw/yellow_tripdata_YYYY-MM.parquet
     -->
-  /opt/airflow/data/processed/bronze/listening_events/date=YYYY-MM-DD/events.parquet
+  /opt/airflow/data/processed/bronze/yellow_taxi_trips/year=YYYY/month=MM/trips.parquet
 
 Run as a standalone script to verify syntax:
     python solution_02_ingest_events.py
@@ -31,8 +31,8 @@ from airflow.operators.python import PythonOperator
 # Constants
 # ---------------------------------------------------------------------------
 DATA_DIR = "/opt/airflow/data"
-RAW_EVENTS_DIR = f"{DATA_DIR}/raw/listening_events"
-BRONZE_EVENTS_DIR = f"{DATA_DIR}/processed/bronze/listening_events"
+RAW_DIR = f"{DATA_DIR}/raw"
+BRONZE_DIR = f"{DATA_DIR}/processed/bronze/yellow_taxi_trips"
 
 # ---------------------------------------------------------------------------
 # Default args
@@ -50,21 +50,23 @@ default_args = {
 # ---------------------------------------------------------------------------
 def check_source_file(ds: str, **context):
     """
-    Verify that the raw JSONL file exists for the given logical date.
+    Verify that the raw Parquet file exists for the given logical date's month.
 
     If the file does not exist, we raise AirflowSkipException so that
     downstream tasks are skipped rather than marked as failed. This is
-    the recommended pattern for handling expected gaps in data (weekends,
-    holidays, etc.).
+    the recommended pattern for handling expected gaps in data (e.g., we
+    only have data for certain months).
 
     Args:
         ds: The logical date string (YYYY-MM-DD), injected by Airflow.
     """
-    source_path = f"{RAW_EVENTS_DIR}/events_{ds}.jsonl"
+    # Extract year-month from ds to match file naming convention
+    year_month = ds[:7]  # "YYYY-MM"
+    source_path = f"{RAW_DIR}/yellow_tripdata_{year_month}.parquet"
     if not os.path.exists(source_path):
         raise AirflowSkipException(
             f"Source file not found: {source_path}. "
-            f"No listening events for {ds}. Skipping."
+            f"No yellow taxi data for {year_month}. Skipping."
         )
     # Report file size for observability
     size_mb = os.path.getsize(source_path) / (1024 * 1024)
@@ -74,14 +76,15 @@ def check_source_file(ds: str, **context):
 
 def ingest_to_bronze(ds: str, ti, **context):
     """
-    Read the raw JSONL file and write it as a Parquet file in the Bronze layer.
+    Read the raw Parquet file and write it to the Bronze layer, partitioned
+    by year and month.
 
     Bronze layer convention: data is stored as-is from the source, with no
-    transformations other than format conversion. We add a partition column
-    (date=YYYY-MM-DD) in the directory structure for efficient querying.
+    transformations other than reorganizing into the medallion directory
+    structure. We partition by year/month for efficient querying.
 
     Idempotency: We overwrite the output file if it already exists, so
-    re-running this task for the same date produces identical output.
+    re-running this task for the same month produces identical output.
 
     Args:
         ds: The logical date string (YYYY-MM-DD), injected by Airflow.
@@ -91,17 +94,19 @@ def ingest_to_bronze(ds: str, ti, **context):
     # lightweight at parse time. This is an Airflow best practice.
     import pandas as pd
 
-    source_path = f"{RAW_EVENTS_DIR}/events_{ds}.jsonl"
+    year_month = ds[:7]
+    year, month = year_month.split("-")
+    source_path = f"{RAW_DIR}/yellow_tripdata_{year_month}.parquet"
 
-    # Read JSONL (one JSON object per line)
+    # Read raw Parquet
     print(f"Reading: {source_path}")
-    df = pd.read_json(source_path, lines=True)
+    df = pd.read_parquet(source_path)
     print(f"Read {len(df)} records with columns: {list(df.columns)}")
 
-    # Create output directory (partitioned by date)
-    output_dir = f"{BRONZE_EVENTS_DIR}/date={ds}"
+    # Create output directory (partitioned by year and month)
+    output_dir = f"{BRONZE_DIR}/year={year}/month={month}"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = f"{output_dir}/events.parquet"
+    output_path = f"{output_dir}/trips.parquet"
 
     # Write to Parquet with Snappy compression (the default and fastest option)
     df.to_parquet(output_path, engine="pyarrow", compression="snappy", index=False)
@@ -133,9 +138,9 @@ def log_record_count(ti, ds: str, **context):
     output_path = ti.xcom_pull(task_ids="ingest_to_bronze", key="output_path")
 
     print("=" * 60)
-    print(f"  Ingestion Summary for {ds}")
+    print(f"  Ingestion Summary for {ds[:7]}")
     print("=" * 60)
-    print(f"  Records ingested : {row_count}")
+    print(f"  Trips ingested   : {row_count}")
     print(f"  Output file      : {output_path}")
     print("=" * 60)
 
@@ -144,13 +149,13 @@ def log_record_count(ti, ds: str, **context):
 # DAG definition
 # ---------------------------------------------------------------------------
 with DAG(
-    dag_id="ingest_listening_events",
-    description="Ingest raw JSONL listening events into Bronze Parquet (partitioned by date)",
+    dag_id="ingest_yellow_taxi_trips",
+    description="Ingest raw yellow taxi Parquet into Bronze layer (partitioned by year/month)",
     default_args=default_args,
-    start_date=datetime(2018, 1, 10),     # First available data date
-    schedule="@daily",
+    start_date=datetime(2023, 1, 1),     # First available data month
+    schedule="@monthly",
     catchup=False,
-    tags=["module-03", "bronze", "ingestion"],
+    tags=["module-03", "bronze", "ingestion", "yellow-taxi"],
 ) as dag:
 
     check = PythonOperator(
