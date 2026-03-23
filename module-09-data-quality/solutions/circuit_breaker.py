@@ -13,7 +13,6 @@ Critical override: if score < critical threshold, halt immediately and
 escalate regardless of other settings.
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 

@@ -5,24 +5,12 @@ Validates foreign key relationships across all raw datasets.
 Reports orphaned records for each relationship.
 """
 
-import json
 from pathlib import Path
 
 import pandas as pd
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
-
-
-def load_listening_events() -> pd.DataFrame:
-    events_dir = RAW_DIR / "listening_events"
-    frames = []
-    for f in sorted(events_dir.glob("events_*.jsonl")):
-        lines = f.read_text().strip().split("\n")
-        records = [json.loads(line) for line in lines if line.strip()]
-        if records:
-            frames.append(pd.DataFrame(records))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def check_referential_integrity(
@@ -48,42 +36,63 @@ def check_referential_integrity(
         "orphaned_keys": orphan_count,
         "orphan_pct": round(orphan_pct, 2),
         "passed": orphan_count == 0,
-        "sample_orphans": sorted(list(orphans))[:10],
+        "sample_orphans": sorted([str(o) for o in list(orphans)])[:10],
     }
 
 
 def main():
     print("Loading datasets...")
-    users = pd.read_csv(RAW_DIR / "users.csv")
-    cdn = pd.read_csv(RAW_DIR / "cdn_logs.csv")
-    podcasts = pd.DataFrame(json.loads((RAW_DIR / "podcasts.json").read_text()))
-    episodes = pd.DataFrame(json.loads((RAW_DIR / "episodes.json").read_text()))
-    ad_events = pd.DataFrame(json.loads((RAW_DIR / "ad_events.json").read_text()))
-    events = load_listening_events()
+
+    # Load yellow trip data
+    yellow_frames = []
+    for f in sorted(RAW_DIR.glob("yellow_tripdata_*.parquet")):
+        yellow_frames.append(pd.read_parquet(f))
+    yellow = pd.concat(yellow_frames, ignore_index=True) if yellow_frames else pd.DataFrame()
+
+    # Load green trip data
+    green_frames = []
+    for f in sorted(RAW_DIR.glob("green_tripdata_*.parquet")):
+        green_frames.append(pd.read_parquet(f))
+    green = pd.concat(green_frames, ignore_index=True) if green_frames else pd.DataFrame()
+
+    # Load reference tables
+    zones = pd.read_csv(RAW_DIR / "taxi_zone_lookup.csv")
+    vendors = pd.read_csv(RAW_DIR / "vendors.csv")
+    payment_types = pd.read_csv(RAW_DIR / "payment_types.csv")
+    rate_codes = pd.read_csv(RAW_DIR / "rate_codes.csv")
 
     print(f"\n{'=' * 90}")
     print("  REFERENTIAL INTEGRITY REPORT")
     print(f"{'=' * 90}")
 
     checks = [
-        # listening_events.user_id -> users.user_id
-        (events, "user_id", users, "user_id", "listening_events", "users"),
-        # listening_events.episode_id -> episodes.episode_id
-        (events, "episode_id", episodes, "episode_id", "listening_events", "episodes"),
-        # episodes.podcast_id -> podcasts.podcast_id
-        (episodes, "podcast_id", podcasts, "podcast_id", "episodes", "podcasts"),
-        # cdn_logs.event_id -> listening_events.event_id
-        (cdn, "event_id", events, "event_id", "cdn_logs", "listening_events"),
-        # cdn_logs.user_id -> users.user_id
-        (cdn, "user_id", users, "user_id", "cdn_logs", "users"),
-        # ad_events.event_id -> listening_events.event_id
-        (ad_events, "event_id", events, "event_id", "ad_events", "listening_events"),
-        # ad_events.user_id -> users.user_id
-        (ad_events, "user_id", users, "user_id", "ad_events", "users"),
+        # yellow_trips.PULocationID -> zones.LocationID
+        (yellow, "PULocationID", zones, "LocationID", "yellow_trips", "taxi_zones"),
+        # yellow_trips.DOLocationID -> zones.LocationID
+        (yellow, "DOLocationID", zones, "LocationID", "yellow_trips", "taxi_zones"),
+        # yellow_trips.VendorID -> vendors.vendor_id
+        (yellow, "VendorID", vendors, "vendor_id", "yellow_trips", "vendors"),
+        # yellow_trips.payment_type -> payment_types.payment_type_id
+        (yellow, "payment_type", payment_types, "payment_type_id",
+         "yellow_trips", "payment_types"),
+        # yellow_trips.RatecodeID -> rate_codes.rate_code_id
+        (yellow, "RatecodeID", rate_codes, "rate_code_id",
+         "yellow_trips", "rate_codes"),
+        # green_trips.PULocationID -> zones.LocationID
+        (green, "PULocationID", zones, "LocationID", "green_trips", "taxi_zones"),
+        # green_trips.DOLocationID -> zones.LocationID
+        (green, "DOLocationID", zones, "LocationID", "green_trips", "taxi_zones"),
+        # green_trips.VendorID -> vendors.vendor_id
+        (green, "VendorID", vendors, "vendor_id", "green_trips", "vendors"),
+        # green_trips.payment_type -> payment_types.payment_type_id
+        (green, "payment_type", payment_types, "payment_type_id",
+         "green_trips", "payment_types"),
     ]
 
     results = []
     for child_df, child_col, parent_df, parent_col, child_name, parent_name in checks:
+        if child_df.empty or child_col not in child_df.columns:
+            continue
         result = check_referential_integrity(
             child_df, child_col, parent_df, parent_col, child_name, parent_name
         )
