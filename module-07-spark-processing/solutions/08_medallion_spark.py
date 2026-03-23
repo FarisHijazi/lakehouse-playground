@@ -1,7 +1,13 @@
 """
-Exercise 10: Full Bronze -> Silver -> Gold Pipeline in PySpark
+Exercise 8: Full Bronze -> Silver -> Gold Pipeline in PySpark
 ===============================================================
-Implements the medallion architecture using Spark DataFrames.
+Implements the medallion architecture using Spark DataFrames on NYC taxi data.
+
+Databricks equivalent:
+    - Bronze: Auto Loader (cloudFiles) for incremental ingestion
+    - Silver/Gold: Delta Live Tables (DLT) for declarative pipelines
+    - Use Delta format throughout for ACID transactions
+    - Unity Catalog for table governance and lineage
 """
 
 from pathlib import Path
@@ -9,24 +15,19 @@ from pathlib import Path
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     avg,
-    coalesce,
     col,
     count,
     countDistinct,
     current_timestamp,
-    datediff,
+    dayofweek,
     desc,
-    first,
+    hour,
     input_file_name,
     lit,
-    lower,
-    max as spark_max,
-    min as spark_min,
     round as spark_round,
     sum as spark_sum,
     to_date,
     to_timestamp,
-    trim,
     when,
 )
 
@@ -35,14 +36,15 @@ def main():
     spark = (
         SparkSession.builder
         .master("local[*]")
-        .appName("PodcastAnalytics-Medallion")
+        .appName("TaxiAnalytics-Medallion")
         .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    raw_dir = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
-    output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "spark_output"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    raw_dir = PROJECT_ROOT / "data" / "raw"
+    output_dir = PROJECT_ROOT / "data" / "spark_output"
 
     bronze_dir = output_dir / "bronze"
     silver_dir = output_dir / "silver"
@@ -57,65 +59,65 @@ def main():
     print("BRONZE LAYER: Raw ingestion with metadata")
     print("=" * 70)
 
-    # --- Podcasts ---
-    podcasts_raw = (
-        spark.read.json(str(raw_dir / "podcasts.json"), multiLine=True)
-        .withColumn("_source_file", lit("podcasts.json"))
-        .withColumn("_ingested_at", current_timestamp())
-        .withColumn("_batch_id", lit(batch_id))
-    )
-    podcasts_raw.write.mode("overwrite").parquet(str(bronze_dir / "podcasts"))
-    print(f"Bronze podcasts : {podcasts_raw.count():>8,} rows")
-
-    # --- Episodes ---
-    episodes_raw = (
-        spark.read.json(str(raw_dir / "episodes.json"), multiLine=True)
-        .withColumn("_source_file", lit("episodes.json"))
-        .withColumn("_ingested_at", current_timestamp())
-        .withColumn("_batch_id", lit(batch_id))
-    )
-    episodes_raw.write.mode("overwrite").parquet(str(bronze_dir / "episodes"))
-    print(f"Bronze episodes : {episodes_raw.count():>8,} rows")
-
-    # --- Users ---
-    users_raw = (
-        spark.read.csv(str(raw_dir / "users.csv"), header=True, inferSchema=True)
-        .withColumn("_source_file", lit("users.csv"))
-        .withColumn("_ingested_at", current_timestamp())
-        .withColumn("_batch_id", lit(batch_id))
-    )
-    users_raw.write.mode("overwrite").parquet(str(bronze_dir / "users"))
-    print(f"Bronze users    : {users_raw.count():>8,} rows")
-
-    # --- Listening Events ---
-    events_raw = (
-        spark.read.json(str(raw_dir / "listening_events"))
+    # --- Yellow Taxi Trips ---
+    yellow_raw = (
+        spark.read.parquet(str(raw_dir / "yellow_tripdata_*.parquet"))
         .withColumn("_source_file", input_file_name())
         .withColumn("_ingested_at", current_timestamp())
         .withColumn("_batch_id", lit(batch_id))
     )
-    events_raw.write.mode("overwrite").parquet(str(bronze_dir / "listening_events"))
-    print(f"Bronze events   : {events_raw.count():>8,} rows")
+    yellow_raw.write.mode("overwrite").parquet(str(bronze_dir / "yellow_trips"))
+    print(f"Bronze yellow   : {yellow_raw.count():>10,} rows")
 
-    # --- CDN Logs ---
-    cdn_raw = (
-        spark.read.csv(str(raw_dir / "cdn_logs.csv"), header=True, inferSchema=True)
-        .withColumn("_source_file", lit("cdn_logs.csv"))
+    # --- Green Taxi Trips ---
+    green_raw = (
+        spark.read.parquet(str(raw_dir / "green_tripdata_*.parquet"))
+        .withColumn("_source_file", input_file_name())
         .withColumn("_ingested_at", current_timestamp())
         .withColumn("_batch_id", lit(batch_id))
     )
-    cdn_raw.write.mode("overwrite").parquet(str(bronze_dir / "cdn_logs"))
-    print(f"Bronze CDN logs : {cdn_raw.count():>8,} rows")
+    green_raw.write.mode("overwrite").parquet(str(bronze_dir / "green_trips"))
+    print(f"Bronze green    : {green_raw.count():>10,} rows")
 
-    # --- Ad Events ---
-    ads_raw = (
-        spark.read.json(str(raw_dir / "ad_events.json"), multiLine=True)
-        .withColumn("_source_file", lit("ad_events.json"))
+    # --- Taxi Zone Lookup ---
+    zones_raw = (
+        spark.read.csv(str(raw_dir / "taxi_zone_lookup.csv"), header=True, inferSchema=True)
+        .withColumn("_source_file", lit("taxi_zone_lookup.csv"))
         .withColumn("_ingested_at", current_timestamp())
         .withColumn("_batch_id", lit(batch_id))
     )
-    ads_raw.write.mode("overwrite").parquet(str(bronze_dir / "ad_events"))
-    print(f"Bronze ad events: {ads_raw.count():>8,} rows")
+    zones_raw.write.mode("overwrite").parquet(str(bronze_dir / "zones"))
+    print(f"Bronze zones    : {zones_raw.count():>10,} rows")
+
+    # --- Payment Types ---
+    payment_raw = (
+        spark.read.csv(str(raw_dir / "payment_types.csv"), header=True, inferSchema=True)
+        .withColumn("_source_file", lit("payment_types.csv"))
+        .withColumn("_ingested_at", current_timestamp())
+        .withColumn("_batch_id", lit(batch_id))
+    )
+    payment_raw.write.mode("overwrite").parquet(str(bronze_dir / "payment_types"))
+    print(f"Bronze payments : {payment_raw.count():>10,} rows")
+
+    # --- Weather ---
+    weather_raw = (
+        spark.read.csv(str(raw_dir / "nyc_weather_2023.csv"), header=True, inferSchema=True)
+        .withColumn("_source_file", lit("nyc_weather_2023.csv"))
+        .withColumn("_ingested_at", current_timestamp())
+        .withColumn("_batch_id", lit(batch_id))
+    )
+    weather_raw.write.mode("overwrite").parquet(str(bronze_dir / "weather"))
+    print(f"Bronze weather  : {weather_raw.count():>10,} rows")
+
+    # --- Rate Codes ---
+    rate_codes_raw = (
+        spark.read.csv(str(raw_dir / "rate_codes.csv"), header=True, inferSchema=True)
+        .withColumn("_source_file", lit("rate_codes.csv"))
+        .withColumn("_ingested_at", current_timestamp())
+        .withColumn("_batch_id", lit(batch_id))
+    )
+    rate_codes_raw.write.mode("overwrite").parquet(str(bronze_dir / "rate_codes"))
+    print(f"Bronze rates    : {rate_codes_raw.count():>10,} rows")
     print()
 
     # ==================================================================
@@ -126,94 +128,109 @@ def main():
     print("=" * 70)
 
     # --- Read from Bronze ---
-    podcasts_bronze = spark.read.parquet(str(bronze_dir / "podcasts"))
-    episodes_bronze = spark.read.parquet(str(bronze_dir / "episodes"))
-    users_bronze = spark.read.parquet(str(bronze_dir / "users"))
-    events_bronze = spark.read.parquet(str(bronze_dir / "listening_events"))
-    cdn_bronze = spark.read.parquet(str(bronze_dir / "cdn_logs"))
-    ads_bronze = spark.read.parquet(str(bronze_dir / "ad_events"))
+    yellow_bronze = spark.read.parquet(str(bronze_dir / "yellow_trips"))
+    green_bronze = spark.read.parquet(str(bronze_dir / "green_trips"))
+    zones_bronze = spark.read.parquet(str(bronze_dir / "zones"))
+    payment_bronze = spark.read.parquet(str(bronze_dir / "payment_types"))
+    weather_bronze = spark.read.parquet(str(bronze_dir / "weather"))
 
-    # --- Clean users ---
-    users_silver = (
-        users_bronze
-        # Standardize gender
-        .withColumn(
-            "gender",
-            when(lower(trim(col("gender"))).isin("m", "male"), "M")
-            .when(lower(trim(col("gender"))).isin("f", "female"), "F")
-            .otherwise("Unknown"),
+    # --- Clean yellow trips ---
+    yellow_silver = (
+        yellow_bronze
+        # Filter invalid trips
+        .filter(
+            (col("trip_distance") > 0)
+            & (col("fare_amount") > 0)
+            & (col("fare_amount") < 1000)
+            & (col("passenger_count") > 0)
         )
-        # Parse signup_date (multiple formats)
+        # Add derived columns
+        .withColumn("pickup_date", to_date(col("tpep_pickup_datetime")))
+        .withColumn("pickup_hour", hour(col("tpep_pickup_datetime")))
+        .withColumn("day_of_week", dayofweek(col("tpep_pickup_datetime")))
         .withColumn(
-            "signup_date",
-            coalesce(
-                to_date(col("signup_date"), "yyyy-MM-dd"),
-                to_date(col("signup_date"), "dd-MM-yyyy"),
-                to_date(col("signup_date"), "dd/MM/yyyy"),
+            "trip_duration_minutes",
+            spark_round(
+                (col("tpep_dropoff_datetime").cast("long")
+                 - col("tpep_pickup_datetime").cast("long")) / 60.0,
+                2,
             ),
         )
-        # Fill missing city
-        .fillna({"city": "Unknown"})
-        # Cast age and filter invalid
-        .withColumn("age", col("age").cast("int"))
-        .filter((col("age") >= 13) & (col("age") <= 120))
-        # Drop bronze metadata (keep clean data only)
+        .withColumn(
+            "tip_pct",
+            when(col("fare_amount") > 0,
+                 spark_round(col("tip_amount") / col("fare_amount") * 100, 2))
+            .otherwise(0),
+        )
+        .withColumn("taxi_type", lit("yellow"))
+        # Filter unreasonable durations
+        .filter(
+            (col("trip_duration_minutes") > 0)
+            & (col("trip_duration_minutes") < 300)
+        )
+        # Drop bronze metadata
         .drop("_source_file", "_ingested_at", "_batch_id")
     )
 
-    users_silver.write.mode("overwrite").parquet(str(silver_dir / "users"))
-    print(f"Silver users    : {users_silver.count():>8,} rows")
-    users_silver.show(5, truncate=False)
+    yellow_silver.write.mode("overwrite").partitionBy("pickup_date").parquet(
+        str(silver_dir / "yellow_trips")
+    )
+    print(f"Silver yellow   : {yellow_silver.count():>10,} rows")
 
-    # --- Clean listening events ---
-    events_silver = (
-        events_bronze
-        # Cast and filter
-        .withColumn("listened_seconds", col("listened_seconds").cast("int"))
-        .filter(col("listened_seconds") > 0)
-        # Parse timestamp
-        .withColumn("timestamp", to_timestamp(col("timestamp")))
-        # Deduplicate by event_id
-        .dropDuplicates(["event_id"])
-        # Add date column for partitioning
-        .withColumn("event_date", to_date(col("timestamp")))
+    # --- Clean green trips ---
+    green_silver = (
+        green_bronze
+        .filter(
+            (col("trip_distance") > 0)
+            & (col("fare_amount") > 0)
+            & (col("fare_amount") < 1000)
+        )
+        .withColumn("pickup_date", to_date(col("lpep_pickup_datetime")))
+        .withColumn("pickup_hour", hour(col("lpep_pickup_datetime")))
+        .withColumn("day_of_week", dayofweek(col("lpep_pickup_datetime")))
+        .withColumn(
+            "trip_duration_minutes",
+            spark_round(
+                (col("lpep_dropoff_datetime").cast("long")
+                 - col("lpep_pickup_datetime").cast("long")) / 60.0,
+                2,
+            ),
+        )
+        .withColumn(
+            "tip_pct",
+            when(col("fare_amount") > 0,
+                 spark_round(col("tip_amount") / col("fare_amount") * 100, 2))
+            .otherwise(0),
+        )
+        .withColumn("taxi_type", lit("green"))
+        .filter(
+            (col("trip_duration_minutes") > 0)
+            & (col("trip_duration_minutes") < 300)
+        )
         .drop("_source_file", "_ingested_at", "_batch_id")
     )
 
-    # Enrich with episode/podcast info
-    events_enriched = events_silver.join(
-        episodes_bronze.select("episode_id", "podcast_id", "duration_seconds"),
-        on="episode_id",
-        how="left",
+    green_silver.write.mode("overwrite").partitionBy("pickup_date").parquet(
+        str(silver_dir / "green_trips")
     )
+    print(f"Silver green    : {green_silver.count():>10,} rows")
 
-    events_enriched.write.mode("overwrite").partitionBy("event_date").parquet(
-        str(silver_dir / "listening_events")
+    # --- Clean dimension tables (passthrough with minor cleanup) ---
+    zones_silver = zones_bronze.drop("_source_file", "_ingested_at", "_batch_id")
+    zones_silver.write.mode("overwrite").parquet(str(silver_dir / "zones"))
+    print(f"Silver zones    : {zones_silver.count():>10,} rows")
+
+    payment_silver = payment_bronze.drop("_source_file", "_ingested_at", "_batch_id")
+    payment_silver.write.mode("overwrite").parquet(str(silver_dir / "payment_types"))
+    print(f"Silver payments : {payment_silver.count():>10,} rows")
+
+    weather_silver = (
+        weather_bronze
+        .withColumn("weather_date", to_date(col("date")))
+        .drop("date", "_source_file", "_ingested_at", "_batch_id")
     )
-    print(f"Silver events   : {events_enriched.count():>8,} rows")
-    events_enriched.show(5, truncate=False)
-
-    # --- Clean podcasts and episodes (passthrough with minor cleanup) ---
-    podcasts_silver = podcasts_bronze.drop("_source_file", "_ingested_at", "_batch_id")
-    podcasts_silver.write.mode("overwrite").parquet(str(silver_dir / "podcasts"))
-    print(f"Silver podcasts : {podcasts_silver.count():>8,} rows")
-
-    episodes_silver = (
-        episodes_bronze
-        .withColumn("published_at", to_timestamp(col("published_at")))
-        .drop("_source_file", "_ingested_at", "_batch_id")
-    )
-    episodes_silver.write.mode("overwrite").parquet(str(silver_dir / "episodes"))
-    print(f"Silver episodes : {episodes_silver.count():>8,} rows")
-
-    # CDN and ads silver
-    cdn_silver = cdn_bronze.drop("_source_file", "_ingested_at", "_batch_id")
-    cdn_silver.write.mode("overwrite").parquet(str(silver_dir / "cdn_logs"))
-    print(f"Silver CDN logs : {cdn_silver.count():>8,} rows")
-
-    ads_silver = ads_bronze.drop("_source_file", "_ingested_at", "_batch_id")
-    ads_silver.write.mode("overwrite").parquet(str(silver_dir / "ad_events"))
-    print(f"Silver ad events: {ads_silver.count():>8,} rows")
+    weather_silver.write.mode("overwrite").parquet(str(silver_dir / "weather"))
+    print(f"Silver weather  : {weather_silver.count():>10,} rows")
     print()
 
     # ==================================================================
@@ -224,107 +241,73 @@ def main():
     print("=" * 70)
 
     # Read from Silver
-    events_s = spark.read.parquet(str(silver_dir / "listening_events"))
-    users_s = spark.read.parquet(str(silver_dir / "users"))
-    podcasts_s = spark.read.parquet(str(silver_dir / "podcasts"))
+    yellow_s = spark.read.parquet(str(silver_dir / "yellow_trips"))
+    green_s = spark.read.parquet(str(silver_dir / "green_trips"))
+    zones_s = spark.read.parquet(str(silver_dir / "zones"))
 
-    # --- Gold 1: Podcast Performance ---
-    podcast_perf = (
-        events_s
-        .groupBy("podcast_id")
+    # --- Gold 1: Zone Performance ---
+    zone_perf = (
+        yellow_s
+        .groupBy("PULocationID")
         .agg(
-            count("*").alias("total_events"),
-            countDistinct("user_id").alias("unique_listeners"),
-            spark_round(spark_sum("listened_seconds") / 3600.0, 2).alias("total_hours"),
-            spark_round(avg("listened_seconds"), 2).alias("avg_seconds_per_event"),
-            spark_round(
-                avg(
-                    when(
-                        col("duration_seconds") > 0,
-                        col("listened_seconds") / col("duration_seconds") * 100,
-                    )
-                ),
-                2,
-            ).alias("avg_completion_pct"),
+            count("*").alias("total_trips"),
+            spark_round(spark_sum("fare_amount"), 2).alias("total_fare"),
+            spark_round(avg("fare_amount"), 2).alias("avg_fare"),
+            spark_round(avg("trip_distance"), 2).alias("avg_distance"),
+            spark_round(avg("tip_pct"), 2).alias("avg_tip_pct"),
+            spark_round(avg("trip_duration_minutes"), 2).alias("avg_duration_min"),
         )
-        .join(podcasts_s.select("podcast_id", "name_en", "category"), on="podcast_id", how="left")
-        .orderBy(desc("total_hours"))
-    )
-
-    podcast_perf.write.mode("overwrite").parquet(str(gold_dir / "podcast_performance"))
-    print("=== Gold: Podcast Performance ===")
-    podcast_perf.show(truncate=False)
-
-    # --- Gold 2: User Engagement ---
-    # Find each user's most-listened podcast
-    user_podcast_time = (
-        events_s
-        .groupBy("user_id", "podcast_id")
-        .agg(spark_sum("listened_seconds").alias("podcast_seconds"))
-    )
-
-    from pyspark.sql.window import Window
-
-    user_fav_window = Window.partitionBy("user_id").orderBy(desc("podcast_seconds"))
-    user_fav_podcast = (
-        user_podcast_time
-        .withColumn("rn", countDistinct(lit(1)).over(user_fav_window))  # placeholder
-    )
-    # Simpler approach: use first() with ordering
-    user_fav = (
-        user_podcast_time
-        .orderBy("user_id", desc("podcast_seconds"))
-        .groupBy("user_id")
-        .agg(first("podcast_id").alias("favorite_podcast"))
-    )
-
-    user_engagement = (
-        events_s
-        .groupBy("user_id")
-        .agg(
-            count("*").alias("total_events"),
-            countDistinct("podcast_id").alias("distinct_podcasts"),
-            countDistinct("episode_id").alias("distinct_episodes"),
-            spark_round(spark_sum("listened_seconds") / 3600.0, 2).alias("total_hours"),
-            spark_max("timestamp").alias("last_event_at"),
-        )
-        .withColumn(
-            "days_since_last_listen",
-            datediff(current_timestamp(), col("last_event_at")),
-        )
-        .join(user_fav, on="user_id", how="left")
         .join(
-            users_s.select("user_id", "country", "subscription_type"),
-            on="user_id",
+            zones_s.select("LocationID", "Borough", "Zone", "service_zone"),
+            col("PULocationID") == col("LocationID"),
             how="left",
         )
-        .orderBy(desc("total_hours"))
+        .drop("LocationID")
+        .orderBy(desc("total_trips"))
     )
 
-    user_engagement.write.mode("overwrite").parquet(str(gold_dir / "user_engagement"))
-    print("=== Gold: User Engagement (top 20) ===")
-    user_engagement.show(20, truncate=False)
+    zone_perf.write.mode("overwrite").parquet(str(gold_dir / "zone_performance"))
+    print("=== Gold: Zone Performance ===")
+    zone_perf.show(15, truncate=False)
 
-    # --- Gold 3: Daily Metrics ---
+    # --- Gold 2: Daily Metrics ---
     daily_metrics = (
-        events_s
-        .groupBy("event_date")
+        yellow_s
+        .groupBy("pickup_date")
         .agg(
-            countDistinct("user_id").alias("daily_active_users"),
-            count("*").alias("total_events"),
-            spark_round(spark_sum("listened_seconds") / 3600.0, 2).alias("total_hours"),
-            count(when(col("event_type") == "play", True)).alias("plays"),
-            count(when(col("event_type") == "pause", True)).alias("pauses"),
-            count(when(col("event_type") == "complete", True)).alias("completes"),
-            count(when(col("event_type") == "skip", True)).alias("skips"),
-            count(when(col("event_type") == "resume", True)).alias("resumes"),
+            count("*").alias("total_trips"),
+            countDistinct("PULocationID").alias("active_zones"),
+            spark_round(spark_sum("fare_amount"), 2).alias("total_fare"),
+            spark_round(spark_sum("tip_amount"), 2).alias("total_tips"),
+            spark_round(avg("trip_distance"), 2).alias("avg_distance"),
+            spark_round(avg("fare_amount"), 2).alias("avg_fare"),
+            spark_round(avg("tip_pct"), 2).alias("avg_tip_pct"),
+            spark_round(avg("trip_duration_minutes"), 2).alias("avg_duration_min"),
         )
-        .orderBy("event_date")
+        .orderBy("pickup_date")
     )
 
     daily_metrics.write.mode("overwrite").parquet(str(gold_dir / "daily_metrics"))
-    print("=== Gold: Daily Metrics (sample) ===")
+    print("=== Gold: Daily Metrics ===")
     daily_metrics.show(20, truncate=False)
+
+    # --- Gold 3: Hourly Patterns ---
+    hourly_patterns = (
+        yellow_s
+        .groupBy("pickup_hour")
+        .agg(
+            count("*").alias("total_trips"),
+            spark_round(avg("fare_amount"), 2).alias("avg_fare"),
+            spark_round(avg("trip_distance"), 2).alias("avg_distance"),
+            spark_round(avg("tip_pct"), 2).alias("avg_tip_pct"),
+            spark_round(avg("trip_duration_minutes"), 2).alias("avg_duration_min"),
+        )
+        .orderBy("pickup_hour")
+    )
+
+    hourly_patterns.write.mode("overwrite").parquet(str(gold_dir / "hourly_patterns"))
+    print("=== Gold: Hourly Patterns ===")
+    hourly_patterns.show(24, truncate=False)
 
     # ==================================================================
     # Validation summary
@@ -333,9 +316,9 @@ def main():
     print("PIPELINE SUMMARY")
     print("=" * 70)
     for layer, tables in [
-        ("Bronze", ["podcasts", "episodes", "users", "listening_events", "cdn_logs", "ad_events"]),
-        ("Silver", ["podcasts", "episodes", "users", "listening_events", "cdn_logs", "ad_events"]),
-        ("Gold", ["podcast_performance", "user_engagement", "daily_metrics"]),
+        ("Bronze", ["yellow_trips", "green_trips", "zones", "payment_types", "weather", "rate_codes"]),
+        ("Silver", ["yellow_trips", "green_trips", "zones", "payment_types", "weather"]),
+        ("Gold", ["zone_performance", "daily_metrics", "hourly_patterns"]),
     ]:
         layer_dir = output_dir / layer.lower()
         print(f"\n{layer}:")

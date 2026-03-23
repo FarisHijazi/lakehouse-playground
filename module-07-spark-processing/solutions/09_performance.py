@@ -1,7 +1,13 @@
 """
-Exercise 11: Performance - Explain Plans, Repartition vs Coalesce
+Exercise 9: Performance - Explain Plans, Repartition vs Coalesce
 ==================================================================
-Understanding Spark execution and optimization techniques.
+Understanding Spark execution and optimization techniques with NYC taxi data.
+
+Databricks equivalent:
+    - Use the Spark UI tab in Databricks for visual DAGs and stage details
+    - Databricks auto-optimizes with Photon engine and adaptive execution
+    - Use EXPLAIN FORMATTED in SQL for detailed plans
+    - Databricks caching uses Delta caching (disk-based, faster than memory)
 """
 
 import time
@@ -15,7 +21,7 @@ def main():
     spark = (
         SparkSession.builder
         .master("local[*]")
-        .appName("PodcastAnalytics-Perf")
+        .appName("TaxiAnalytics-Perf")
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
@@ -23,12 +29,17 @@ def main():
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
-    output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "spark_output"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    data_dir = PROJECT_ROOT / "data" / "raw"
+    output_dir = PROJECT_ROOT / "data" / "spark_output"
 
-    events_df = spark.read.json(str(data_dir / "listening_events"))
-    episodes_df = spark.read.json(str(data_dir / "episodes.json"), multiLine=True)
-    podcasts_df = spark.read.json(str(data_dir / "podcasts.json"), multiLine=True)
+    yellow_df = spark.read.parquet(str(data_dir / "yellow_tripdata_*.parquet"))
+    zones_df = spark.read.csv(
+        str(data_dir / "taxi_zone_lookup.csv"), header=True, inferSchema=True
+    )
+    payment_types_df = spark.read.csv(
+        str(data_dir / "payment_types.csv"), header=True, inferSchema=True
+    )
 
     # ----------------------------------------------------------------
     # 1. Simple explain: filter + select
@@ -38,9 +49,9 @@ def main():
     print("=" * 70)
 
     simple_query = (
-        events_df
-        .filter(col("country") == "SA")
-        .select("user_id", "episode_id", "listened_seconds")
+        yellow_df
+        .filter((col("trip_distance") > 0) & (col("fare_amount") > 0))
+        .select("PULocationID", "DOLocationID", "trip_distance", "fare_amount")
     )
 
     print("Physical plan:")
@@ -55,12 +66,12 @@ def main():
     print("=" * 70)
 
     complex_query = (
-        events_df
-        .join(episodes_df, on="episode_id", how="inner")
-        .groupBy("podcast_id")
+        yellow_df
+        .join(zones_df, yellow_df.PULocationID == zones_df.LocationID, how="inner")
+        .groupBy("Borough")
         .agg(
-            spark_sum("listened_seconds").alias("total_seconds"),
-            count("*").alias("total_events"),
+            spark_sum("fare_amount").alias("total_fare"),
+            count("*").alias("total_trips"),
         )
     )
 
@@ -75,25 +86,28 @@ def main():
     print("3. PREDICATE PUSHDOWN ON PARQUET")
     print("=" * 70)
 
-    # Write partitioned parquet first
-    parquet_path = str(output_dir / "perf_test" / "events_by_country")
+    # Write partitioned parquet first (by pickup borough via join)
+    from pyspark.sql.functions import to_date
+
+    parquet_path = str(output_dir / "perf_test" / "trips_by_date")
     (
-        events_df
+        yellow_df
+        .withColumn("pickup_date", to_date(col("tpep_pickup_datetime")))
         .write
         .mode("overwrite")
-        .partitionBy("country")
+        .partitionBy("pickup_date")
         .parquet(parquet_path)
     )
     print(f"Wrote partitioned Parquet to: {parquet_path}\n")
 
     # Read with partition filter
     parquet_df = spark.read.parquet(parquet_path)
-    filtered = parquet_df.filter(col("country") == "SA")
+    filtered = parquet_df.filter(col("pickup_date") == "2023-01-15")
 
     print("Plan with partition pruning:")
     filtered.explain()
-    print("Look for 'PartitionFilters: [isnotnull(country), (country = SA)]'")
-    print("This means Spark skips reading non-SA directories entirely.\n")
+    print("Look for 'PartitionFilters' in the plan.")
+    print("This means Spark skips reading non-matching date directories entirely.\n")
 
     # ----------------------------------------------------------------
     # 4. Repartition vs Coalesce
@@ -102,24 +116,24 @@ def main():
     print("4. REPARTITION VS COALESCE")
     print("=" * 70)
 
-    original_partitions = events_df.rdd.getNumPartitions()
+    original_partitions = yellow_df.rdd.getNumPartitions()
     print(f"Original partitions: {original_partitions}")
 
     # Repartition (increases partitions, causes shuffle)
-    repartitioned = events_df.repartition(8)
+    repartitioned = yellow_df.repartition(8)
     print(f"\nAfter repartition(8): {repartitioned.rdd.getNumPartitions()} partitions")
     print("Repartition plan (note the Exchange/shuffle):")
     repartitioned.explain()
 
     # Coalesce (decreases partitions, NO shuffle)
-    coalesced = events_df.coalesce(4)
+    coalesced = yellow_df.coalesce(4)
     print(f"After coalesce(4): {coalesced.rdd.getNumPartitions()} partitions")
     print("Coalesce plan (note: NO Exchange):")
     coalesced.explain()
 
     # Repartition by column (useful for joins)
-    repartitioned_by_col = events_df.repartition(8, "user_id")
-    print(f"After repartition(8, 'user_id'): {repartitioned_by_col.rdd.getNumPartitions()} partitions")
+    repartitioned_by_col = yellow_df.repartition(8, "PULocationID")
+    print(f"After repartition(8, 'PULocationID'): {repartitioned_by_col.rdd.getNumPartitions()} partitions")
     print("Repartition by column plan:")
     repartitioned_by_col.explain()
 
@@ -141,11 +155,10 @@ def main():
 
     # Run a join with AQE -- Spark will automatically optimize
     aqe_result = (
-        events_df
-        .join(broadcast(podcasts_df), how="cross")  # small table, should auto-broadcast
-        .filter(col("country") == "SA")
-        .groupBy("podcast_id")
-        .agg(count("*").alias("event_count"))
+        yellow_df
+        .join(broadcast(zones_df), yellow_df.PULocationID == zones_df.LocationID, how="inner")
+        .groupBy("Borough")
+        .agg(count("*").alias("trip_count"))
     )
 
     print("\nPlan with AQE (may show AdaptiveSparkPlan):")
@@ -160,29 +173,33 @@ def main():
     print("=" * 70)
 
     # Without cache
-    uncached = events_df.filter(col("country") == "SA")
+    manhattan_trips = yellow_df.filter(col("PULocationID").isin(
+        [161, 162, 163, 164, 170, 186, 234, 236, 237, 239]  # Manhattan zone IDs
+    ))
 
     t0 = time.time()
-    count1 = uncached.count()
-    count2 = uncached.groupBy("event_type").count().collect()
-    count3 = uncached.select("user_id").distinct().count()
+    count1 = manhattan_trips.count()
+    count2 = manhattan_trips.groupBy("PULocationID").count().collect()
+    count3 = manhattan_trips.select("DOLocationID").distinct().count()
     uncached_time = time.time() - t0
     print(f"Without cache: {uncached_time:.2f}s")
-    print(f"  count={count1}, event_types={len(count2)}, unique_users={count3}")
+    print(f"  count={count1}, pickup_zones={len(count2)}, unique_dropoffs={count3}")
 
     # With cache
-    cached = events_df.filter(col("country") == "SA").cache()
+    cached = yellow_df.filter(col("PULocationID").isin(
+        [161, 162, 163, 164, 170, 186, 234, 236, 237, 239]
+    )).cache()
 
     # First call materializes the cache
     cached.count()
 
     t0 = time.time()
     count1 = cached.count()
-    count2 = cached.groupBy("event_type").count().collect()
-    count3 = cached.select("user_id").distinct().count()
+    count2 = cached.groupBy("PULocationID").count().collect()
+    count3 = cached.select("DOLocationID").distinct().count()
     cached_time = time.time() - t0
     print(f"With cache   : {cached_time:.2f}s")
-    print(f"  count={count1}, event_types={len(count2)}, unique_users={count3}")
+    print(f"  count={count1}, pickup_zones={len(count2)}, unique_dropoffs={count3}")
 
     if uncached_time > 0:
         speedup = uncached_time / max(cached_time, 0.001)

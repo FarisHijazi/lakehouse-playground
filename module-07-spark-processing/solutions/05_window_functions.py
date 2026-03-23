@@ -1,7 +1,12 @@
 """
-Exercise 6: Window Functions in Spark
+Exercise 5: Window Functions in Spark
 ======================================
-Ranking, running totals, lag/lead, and moving averages.
+Ranking, running totals, lag/lead, and moving averages on NYC taxi data.
+
+Databricks equivalent:
+    - Same window function syntax works in Databricks notebooks
+    - Use display(df) for interactive visualizations of window results
+    - Window functions are heavily optimized in Databricks Runtime
 """
 
 from pathlib import Path
@@ -11,13 +16,13 @@ from pyspark.sql.functions import (
     avg,
     col,
     count,
-    countDistinct,
     dense_rank,
     desc,
     lag,
     lead,
     percent_rank,
     rank,
+    round as spark_round,
     row_number,
     sum as spark_sum,
     to_date,
@@ -30,167 +35,200 @@ def main():
     spark = (
         SparkSession.builder
         .master("local[*]")
-        .appName("PodcastAnalytics")
+        .appName("TaxiAnalytics")
         .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "raw"
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    data_dir = PROJECT_ROOT / "data" / "raw"
 
-    events_df = spark.read.json(str(data_dir / "listening_events"))
-    episodes_df = spark.read.json(str(data_dir / "episodes.json"), multiLine=True)
-
-    # Join events with episodes to get podcast_id
-    events_enriched = events_df.join(
-        episodes_df.select("episode_id", "podcast_id", "duration_seconds"),
-        on="episode_id",
-        how="inner",
+    yellow_df = spark.read.parquet(str(data_dir / "yellow_tripdata_*.parquet"))
+    zones_df = spark.read.csv(
+        str(data_dir / "taxi_zone_lookup.csv"), header=True, inferSchema=True
     )
 
-    # ----------------------------------------------------------------
-    # 1. Row number: number each user's events chronologically
-    # ----------------------------------------------------------------
-    user_window = Window.partitionBy("user_id").orderBy("timestamp")
+    # Filter to valid trips
+    trips = yellow_df.filter(
+        (col("trip_distance") > 0) & (col("fare_amount") > 0)
+    ).withColumn("pickup_date", to_date(col("tpep_pickup_datetime")))
 
-    user_events_numbered = events_df.withColumn(
-        "event_sequence", row_number().over(user_window)
+    # ----------------------------------------------------------------
+    # 1. Row number: number each zone's trips chronologically
+    # ----------------------------------------------------------------
+    zone_window = Window.partitionBy("PULocationID").orderBy("tpep_pickup_datetime")
+
+    zone_trips_numbered = trips.withColumn(
+        "trip_sequence", row_number().over(zone_window)
     )
 
-    print("=== Row Number: User event sequence ===")
+    print("=== Row Number: Trip sequence per pickup zone ===")
     (
-        user_events_numbered
-        .filter(col("user_id") == "usr_000001")
-        .select("user_id", "event_sequence", "timestamp", "episode_id", "event_type")
-        .orderBy("event_sequence")
+        zone_trips_numbered
+        .filter(col("PULocationID") == 132)  # JFK Airport
+        .select("PULocationID", "trip_sequence", "tpep_pickup_datetime",
+                "trip_distance", "fare_amount")
+        .orderBy("trip_sequence")
         .show(20, truncate=False)
     )
 
     # ----------------------------------------------------------------
-    # 2. Rank: podcasts by total listening time
+    # 2. Rank: zones by total fare revenue
     # ----------------------------------------------------------------
-    podcast_totals = (
-        events_enriched
-        .groupBy("podcast_id")
-        .agg(spark_sum("listened_seconds").alias("total_seconds"))
+    zone_revenue = (
+        trips
+        .groupBy("PULocationID")
+        .agg(spark_sum("fare_amount").alias("total_fare"))
     )
 
-    rank_window = Window.orderBy(desc("total_seconds"))
-    podcast_ranked = podcast_totals.withColumn("rank", rank().over(rank_window))
-
-    print("=== Rank: Podcasts by total listening time ===")
-    podcast_ranked.orderBy("rank").show(truncate=False)
-
-    # ----------------------------------------------------------------
-    # 3. Dense rank: users by distinct episodes listened
-    # ----------------------------------------------------------------
-    user_episode_counts = (
-        events_df
-        .groupBy("user_id")
-        .agg(countDistinct("episode_id").alias("distinct_episodes"))
+    rank_window = Window.orderBy(desc("total_fare"))
+    zones_ranked = (
+        zone_revenue
+        .withColumn("rank", rank().over(rank_window))
+        .join(
+            zones_df.select(
+                col("LocationID"), col("Zone"), col("Borough")
+            ),
+            zone_revenue.PULocationID == zones_df.LocationID,
+            how="left",
+        )
     )
 
-    dense_rank_window = Window.orderBy(desc("distinct_episodes"))
-    users_ranked = user_episode_counts.withColumn(
+    print("=== Rank: Zones by total fare revenue ===")
+    zones_ranked.select("rank", "Zone", "Borough", "total_fare").orderBy("rank").show(
+        15, truncate=False
+    )
+
+    # ----------------------------------------------------------------
+    # 3. Dense rank: zones by average tip percentage
+    # ----------------------------------------------------------------
+    zone_tips = (
+        trips
+        .filter(col("fare_amount") > 0)
+        .groupBy("PULocationID")
+        .agg(
+            spark_round(avg(col("tip_amount") / col("fare_amount") * 100), 2).alias(
+                "avg_tip_pct"
+            ),
+            count("*").alias("trip_count"),
+        )
+        .filter(col("trip_count") >= 100)  # Only zones with enough data
+    )
+
+    dense_rank_window = Window.orderBy(desc("avg_tip_pct"))
+    zones_tip_ranked = zone_tips.withColumn(
         "dense_rank", dense_rank().over(dense_rank_window)
     )
 
-    print("=== Dense Rank: Users by distinct episodes ===")
-    users_ranked.orderBy("dense_rank").show(15, truncate=False)
+    print("=== Dense Rank: Zones by avg tip percentage (min 100 trips) ===")
+    zones_tip_ranked.orderBy("dense_rank").show(15, truncate=False)
 
     # ----------------------------------------------------------------
-    # 4. Running total: cumulative listened_seconds per user
+    # 4. Running total: cumulative fare revenue per zone per day
     # ----------------------------------------------------------------
-    running_window = Window.partitionBy("user_id").orderBy("timestamp").rowsBetween(
-        Window.unboundedPreceding, Window.currentRow
+    daily_zone_revenue = (
+        trips
+        .groupBy("PULocationID", "pickup_date")
+        .agg(spark_sum("fare_amount").alias("daily_fare"))
     )
 
-    running_totals = events_df.withColumn(
-        "cumulative_seconds", spark_sum("listened_seconds").over(running_window)
+    running_window = (
+        Window
+        .partitionBy("PULocationID")
+        .orderBy("pickup_date")
+        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
     )
 
-    print("=== Running Total: Cumulative seconds for usr_000001 ===")
+    running_totals = daily_zone_revenue.withColumn(
+        "cumulative_fare", spark_sum("daily_fare").over(running_window)
+    )
+
+    print("=== Running Total: Cumulative fare for zone 132 (JFK Airport) ===")
     (
         running_totals
-        .filter(col("user_id") == "usr_000001")
-        .select("user_id", "timestamp", "listened_seconds", "cumulative_seconds")
-        .orderBy("timestamp")
+        .filter(col("PULocationID") == 132)
+        .select("PULocationID", "pickup_date", "daily_fare", "cumulative_fare")
+        .orderBy("pickup_date")
         .show(20, truncate=False)
     )
 
     # ----------------------------------------------------------------
-    # 5. Lag / Lead: previous and next event info
+    # 5. Lag / Lead: previous and next day fare comparison per zone
     # ----------------------------------------------------------------
+    day_window = Window.partitionBy("PULocationID").orderBy("pickup_date")
+
     lag_lead_df = (
-        events_df
-        .withColumn("prev_event_type", lag("event_type", 1).over(user_window))
-        .withColumn("next_episode_id", lead("episode_id", 1).over(user_window))
-        .withColumn("prev_timestamp", lag("timestamp", 1).over(user_window))
+        daily_zone_revenue
+        .withColumn("prev_day_fare", lag("daily_fare", 1).over(day_window))
+        .withColumn("next_day_fare", lead("daily_fare", 1).over(day_window))
         .withColumn(
-            "time_since_last_event_sec",
-            unix_timestamp(col("timestamp")) - unix_timestamp(col("prev_timestamp")),
+            "fare_change_pct",
+            spark_round(
+                (col("daily_fare") - col("prev_day_fare"))
+                / col("prev_day_fare") * 100,
+                2,
+            ),
         )
     )
 
-    print("=== Lag/Lead: Previous and next event info ===")
+    print("=== Lag/Lead: Day-over-day fare comparison for zone 161 (Midtown) ===")
     (
         lag_lead_df
-        .filter(col("user_id") == "usr_000001")
+        .filter(col("PULocationID") == 161)
         .select(
-            "user_id", "timestamp", "event_type", "prev_event_type",
-            "episode_id", "next_episode_id", "time_since_last_event_sec",
+            "PULocationID", "pickup_date", "daily_fare",
+            "prev_day_fare", "next_day_fare", "fare_change_pct",
         )
-        .orderBy("timestamp")
+        .orderBy("pickup_date")
         .show(15, truncate=False)
     )
 
     # ----------------------------------------------------------------
-    # 6. Percent rank: user percentile by total listening time
+    # 6. Percent rank: zone percentile by total trip count
     # ----------------------------------------------------------------
-    user_totals = events_df.groupBy("user_id").agg(
-        spark_sum("listened_seconds").alias("total_seconds")
+    zone_counts = trips.groupBy("PULocationID").agg(
+        count("*").alias("total_trips")
     )
 
-    pct_window = Window.orderBy("total_seconds")
-    user_percentiles = user_totals.withColumn(
-        "percentile", percent_rank().over(pct_window)
+    pct_window = Window.orderBy("total_trips")
+    zone_percentiles = zone_counts.withColumn(
+        "percentile", spark_round(percent_rank().over(pct_window), 4)
     )
 
-    print("=== Percent Rank: User percentiles by listening time ===")
-    print("Top 10 users:")
-    user_percentiles.orderBy(desc("total_seconds")).show(10, truncate=False)
+    print("=== Percent Rank: Zone percentiles by trip count ===")
+    print("Top 10 zones:")
+    zone_percentiles.orderBy(desc("total_trips")).show(10, truncate=False)
 
-    print("Bottom 10 users:")
-    user_percentiles.orderBy("total_seconds").show(10, truncate=False)
+    print("Bottom 10 zones:")
+    zone_percentiles.orderBy("total_trips").show(10, truncate=False)
 
     # ----------------------------------------------------------------
-    # 7. Moving average: 7-day moving average of daily listens per podcast
+    # 7. Moving average: 7-day moving average of daily trips citywide
     # ----------------------------------------------------------------
-    daily_listens = (
-        events_enriched
-        .withColumn("date", to_date("timestamp"))
-        .groupBy("podcast_id", "date")
-        .agg(count("*").alias("daily_events"))
+    daily_trips = (
+        trips
+        .groupBy("pickup_date")
+        .agg(
+            count("*").alias("daily_trips"),
+            spark_round(avg("fare_amount"), 2).alias("avg_fare"),
+        )
     )
 
     moving_window = (
         Window
-        .partitionBy("podcast_id")
-        .orderBy("date")
+        .orderBy("pickup_date")
         .rowsBetween(-6, 0)  # current row + 6 preceding = 7 days
     )
 
-    daily_with_ma = daily_listens.withColumn(
-        "events_7day_ma", avg("daily_events").over(moving_window)
+    daily_with_ma = daily_trips.withColumn(
+        "trips_7day_ma", spark_round(avg("daily_trips").over(moving_window), 0)
+    ).withColumn(
+        "fare_7day_ma", spark_round(avg("avg_fare").over(moving_window), 2)
     )
 
-    print("=== Moving Average: 7-day MA of daily events for pod_001 ===")
-    (
-        daily_with_ma
-        .filter(col("podcast_id") == "pod_001")
-        .orderBy("date")
-        .show(30, truncate=False)
-    )
+    print("=== Moving Average: 7-day MA of daily trips and fares ===")
+    daily_with_ma.orderBy("pickup_date").show(30, truncate=False)
 
     spark.stop()
     print("\nDone.")
