@@ -1,17 +1,44 @@
 """
 Module 06 - Exercise 9: Schema Evolution
 ==========================================
-Demonstrate how the medallion architecture handles a new column appearing
-in source data, propagating the change through Bronze -> Silver -> Gold.
+Demonstrate how the medallion architecture handles schema changes, using
+the real-world example of NYC TLC adding the `airport_fee` column to
+yellow taxi data starting in 2019.
+
+Databricks Delta Lake handles schema evolution natively:
+    df.write.format("delta") \\
+        .option("mergeSchema", "true") \\
+        .mode("append") \\
+        .saveAsTable("nyc_taxi.bronze.yellow_trips")
+
+    -- Or via ALTER TABLE:
+    ALTER TABLE nyc_taxi.bronze.yellow_trips
+    ADD COLUMN airport_fee DOUBLE;
+
+    -- Schema evolution in DLT is automatic:
+    @dlt.table
+    def bronze_yellow_trips():
+        return spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "parquet")
+            .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+            .load("/mnt/raw/yellow_tripdata_*.parquet")
+
+Unity Catalog tracks schema versions automatically and provides
+DESCRIBE HISTORY for audit:
+    DESCRIBE HISTORY nyc_taxi.bronze.yellow_trips;
+    SHOW COLUMNS IN nyc_taxi.bronze.yellow_trips;
 """
 
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType,
+    TimestampType, IntegerType,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -21,162 +48,236 @@ BRONZE_DIR = PROJECT_ROOT / "data" / "bronze"
 SILVER_DIR = PROJECT_ROOT / "data" / "silver"
 GOLD_DIR = PROJECT_ROOT / "data" / "gold"
 
-GENDER_MAP = {
-    "m": "male",
-    "male": "male",
-    "f": "female",
-    "female": "female",
-}
 
-AGE_BINS = [12, 17, 24, 34, 44, 54, 64, 120]
-AGE_LABELS = ["13-17", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
+def get_spark() -> SparkSession:
+    return (
+        SparkSession.builder
+        .master("local[*]")
+        .appName("schema_evolution")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.driver.memory", "2g")
+        .getOrCreate()
+    )
 
 
 def main() -> None:
     print("=" * 60)
     print("  SCHEMA EVOLUTION DEMONSTRATION")
+    print("  (NYC TLC airport_fee column addition)")
     print("=" * 60)
 
-    # -----------------------------------------------------------------------
-    # 1. Show current Bronze schema
-    # -----------------------------------------------------------------------
-    bronze_path = BRONZE_DIR / "users" / "part-00000.parquet"
-    old_schema = pq.read_schema(bronze_path)
-    print(f"\n[1] Current Bronze users schema:")
-    for i, name in enumerate(old_schema.names):
-        print(f"    {name}: {old_schema.field(name).type}")
+    spark = get_spark()
 
-    old_df = pd.read_parquet(BRONZE_DIR / "users")
-    print(f"    Total records: {len(old_df):,}")
+    try:
+        # -------------------------------------------------------------------
+        # 1. Show current Bronze schema
+        # -------------------------------------------------------------------
+        bronze_path = str(BRONZE_DIR / "yellow_trips")
+        old_df = spark.read.parquet(bronze_path)
+        old_schema = old_df.schema
+        old_columns = set(old_df.columns)
 
-    # -----------------------------------------------------------------------
-    # 2. Simulate a new batch with an additional column: preferred_language
-    # -----------------------------------------------------------------------
-    print(f"\n[2] Simulating new user batch with 'preferred_language' column...")
+        print(f"\n[1] Current Bronze yellow trips schema:")
+        for field in old_schema.fields:
+            if not field.name.startswith("_"):
+                print(f"    {field.name}: {field.dataType.simpleString()}")
+        print(f"    Total columns: {len(old_schema.fields)}")
+        print(f"    Total records: {old_df.count():,}")
 
-    languages = ["ar", "en", "fr", "ur", "hi", "de", "es"]
-    new_batch_size = 50
+        # Check if airport_fee already exists
+        has_airport_fee = "airport_fee" in old_columns
+        print(f"    airport_fee column present: {has_airport_fee}")
 
-    new_users = pd.DataFrame({
-        "user_id": [f"usr_new_{i:04d}" for i in range(new_batch_size)],
-        "name": [f"NewUser_{i}" for i in range(new_batch_size)],
-        "email": [f"newuser_{i}@example.com" for i in range(new_batch_size)],
-        "country": np.random.choice(["SA", "AE", "EG", "KW"], new_batch_size),
-        "city": np.random.choice(["Riyadh", "Dubai", "Cairo", "Kuwait City"], new_batch_size),
-        "platform": np.random.choice(["ios", "android", "web"], new_batch_size),
-        "signup_date": "2025-06-15",
-        "subscription_type": np.random.choice(["free", "premium"], new_batch_size),
-        "age": np.random.randint(18, 60, new_batch_size).astype(str),
-        "gender": np.random.choice(["male", "female"], new_batch_size),
-        "preferred_language": np.random.choice(languages, new_batch_size),
-        "_ingested_at": datetime.now().isoformat(),
-        "_source_file": "users_v2.csv",
-        "_batch_id": str(uuid.uuid4()),
-    })
+        # -------------------------------------------------------------------
+        # 2. Simulate schema evolution: add airport_fee column
+        # -------------------------------------------------------------------
+        # In real life, this happened when TLC updated their data format
+        # in 2019. Older files don't have airport_fee; newer ones do.
+        #
+        # Databricks Auto Loader handles this automatically:
+        #   .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+        print(f"\n[2] Simulating schema evolution...")
+        print(f"    Scenario: TLC adds 'airport_fee' column to yellow taxi data")
+        print(f"    starting in 2019. Older data files lack this column.")
 
-    print(f"    New batch size: {new_batch_size}")
-    print(f"    New column: preferred_language")
-    print(f"    Sample values: {list(new_users['preferred_language'].head(5))}")
+        # Create a "new batch" that includes airport_fee
+        # Take a sample and add the new column
+        sample_size = min(100, old_df.count())
+        new_batch = old_df.limit(sample_size)
 
-    # -----------------------------------------------------------------------
-    # 3. Append to Bronze (schema union)
-    # -----------------------------------------------------------------------
-    combined = pd.concat([old_df, new_users], ignore_index=True)
-    print(f"\n[3] Bronze after schema evolution:")
-    print(f"    Total records: {len(combined):,}")
-    print(f"    preferred_language nulls: {combined['preferred_language'].isna().sum():,} "
-          f"(old records without the column)")
+        if not has_airport_fee:
+            # Add the new airport_fee column
+            new_batch = new_batch.withColumn(
+                "airport_fee",
+                F.when(
+                    F.col("PULocationID").isin(132, 138)
+                    | F.col("DOLocationID").isin(132, 138),
+                    F.lit(1.75)
+                ).otherwise(F.lit(0.0))
+            )
+        else:
+            print("    airport_fee already exists; simulating with a different column")
+            new_batch = new_batch.withColumn(
+                "congestion_surcharge_v2",
+                F.lit(2.50).cast(DoubleType())
+            )
 
-    # Write the evolved Bronze
-    evolved_path = BRONZE_DIR / "users" / "part-00000.parquet"
-    combined.to_parquet(evolved_path, engine="pyarrow", index=False)
+        new_col = "airport_fee" if not has_airport_fee else "congestion_surcharge_v2"
 
-    # Show new schema
-    new_schema = pq.read_schema(evolved_path)
-    print(f"\n    New Bronze schema:")
-    for name in new_schema.names:
-        print(f"      {name}: {new_schema.field(name).type}")
+        # Update metadata for the new batch
+        new_batch = (
+            new_batch
+            .withColumn("_ingested_at", F.lit(datetime.now().isoformat()))
+            .withColumn("_source_file", F.lit("yellow_tripdata_2024-06.parquet"))
+            .withColumn("_batch_id", F.lit(str(uuid.uuid4())))
+        )
 
-    # Schema diff
-    old_cols = set(old_schema.names)
-    new_cols = set(new_schema.names)
-    added = new_cols - old_cols
-    removed = old_cols - new_cols
-    print(f"\n    Schema diff:")
-    print(f"      Added columns:   {added if added else 'none'}")
-    print(f"      Removed columns: {removed if removed else 'none'}")
+        print(f"    New batch size: {sample_size}")
+        print(f"    New column: {new_col}")
 
-    # -----------------------------------------------------------------------
-    # 4. Update Silver with evolved schema
-    # -----------------------------------------------------------------------
-    print(f"\n[4] Rebuilding Silver with evolved Bronze data...")
+        # -------------------------------------------------------------------
+        # 3. Append to Bronze using unionByName (schema union)
+        # -------------------------------------------------------------------
+        # Databricks Delta Lake:
+        #   df.write.format("delta")
+        #     .option("mergeSchema", "true")
+        #     .mode("append")
+        #     .save("/mnt/bronze/yellow_trips")
+        #
+        # Local PySpark equivalent: unionByName with allowMissingColumns
+        combined = old_df.unionByName(new_batch, allowMissingColumns=True)
 
-    df = combined.copy()
+        print(f"\n[3] Bronze after schema evolution (unionByName):")
+        print(f"    Total records: {combined.count():,}")
 
-    # Same cleaning as silver_users.py
-    df["signup_date"] = pd.to_datetime(df["signup_date"], format="mixed", dayfirst=False, errors="coerce")
-    df["gender"] = (
-        df["gender"].fillna("").astype(str).str.strip().str.lower()
-        .map(GENDER_MAP).fillna("unknown")
-    )
-    df = df.sort_values("signup_date", na_position="first")
-    df = df.drop_duplicates(subset=["user_id"], keep="last")
+        # Show nulls in new column for old records
+        null_count = combined.filter(F.col(new_col).isNull()).count()
+        non_null_count = combined.filter(F.col(new_col).isNotNull()).count()
+        print(f"    {new_col} nulls (old records): {null_count:,}")
+        print(f"    {new_col} populated (new records): {non_null_count:,}")
 
-    df["age"] = pd.to_numeric(df["age"], errors="coerce")
-    median_age = df["age"].median()
-    df["age"] = df["age"].fillna(median_age).astype(int)
-    df["city"] = df["city"].fillna("Unknown")
-    df["signup_year"] = df["signup_date"].dt.year.astype("Int64")
-    df["age_group"] = pd.cut(df["age"], bins=AGE_BINS, labels=AGE_LABELS, right=True)
+        # Write the evolved Bronze
+        evolved_path = str(BRONZE_DIR / "yellow_trips_evolved")
+        combined.write.mode("overwrite").parquet(evolved_path)
 
-    # Handle the new column: fill nulls for old records
-    df["preferred_language"] = df["preferred_language"].fillna("unknown")
+        # -------------------------------------------------------------------
+        # 4. Show schema diff
+        # -------------------------------------------------------------------
+        new_schema = combined.schema
+        new_columns = set(combined.columns)
+        added_cols = new_columns - old_columns
+        removed_cols = old_columns - new_columns
 
-    # Validate
-    valid_mask = df["user_id"].notna() & (df["age"] >= 13) & (df["age"] <= 120)
-    df = df[valid_mask].copy()
+        print(f"\n[4] Schema diff:")
+        print(f"    Added columns:   {added_cols if added_cols else 'none'}")
+        print(f"    Removed columns: {removed_cols if removed_cols else 'none'}")
 
-    keep_cols = [
-        "user_id", "name", "email", "country", "city", "platform",
-        "signup_date", "subscription_type", "age", "gender",
-        "signup_year", "age_group", "preferred_language",
-    ]
-    df = df[keep_cols].reset_index(drop=True)
+        print(f"\n    Evolved schema:")
+        for field in new_schema.fields:
+            marker = " <-- NEW" if field.name in added_cols else ""
+            if not field.name.startswith("_"):
+                print(f"      {field.name}: {field.dataType.simpleString()}{marker}")
 
-    SILVER_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(SILVER_DIR / "users.parquet", engine="pyarrow", index=False)
+        # -------------------------------------------------------------------
+        # 5. Update Silver with evolved schema
+        # -------------------------------------------------------------------
+        # Databricks DLT: Schema evolution is handled automatically when
+        # you set "pipelines.reset.allowed" = "true" or use
+        # @dlt.expect with the new column
+        print(f"\n[5] Rebuilding Silver with evolved Bronze data...")
 
-    print(f"    Silver records: {len(df):,}")
-    print(f"    preferred_language distribution:")
-    for lang, cnt in df["preferred_language"].value_counts().head(10).items():
-        print(f"      {lang}: {cnt:,}")
+        df = combined
 
-    # -----------------------------------------------------------------------
-    # 5. Show Gold backward compatibility
-    # -----------------------------------------------------------------------
-    print(f"\n[5] Gold layer backward compatibility check...")
-    print(f"    Existing Gold queries that don't use preferred_language")
-    print(f"    continue to work without modification.")
+        # Same cleaning as silver_yellow_trips.py
+        df = df.filter(
+            F.col("tpep_pickup_datetime").isNotNull()
+            & F.col("tpep_dropoff_datetime").isNotNull()
+            & (F.col("fare_amount") >= 0)
+            & (F.col("total_amount") >= 0)
+        )
 
-    # Example: existing Gold query still works
-    age_dist = df.groupby("age_group").agg(
-        count=("user_id", "count"),
-        pct_premium=("subscription_type", lambda x: (x == "premium").mean()),
-    ).round(3)
-    print(f"\n    Sample Gold query (age group analysis) -- still works:")
-    print(f"    {age_dist.to_string()}")
+        df = df.dropDuplicates([
+            "tpep_pickup_datetime", "tpep_dropoff_datetime",
+            "PULocationID", "DOLocationID", "fare_amount",
+        ])
 
-    # New Gold query using the new column
-    lang_prefs = df.groupby("preferred_language").agg(
-        users=("user_id", "count"),
-        pct=("user_id", lambda x: len(x) / len(df)),
-    ).sort_values("users", ascending=False).round(3)
-    print(f"\n    New Gold query using preferred_language:")
-    print(f"    {lang_prefs.head(10).to_string()}")
+        # Add computed columns
+        df = df.withColumn(
+            "trip_duration_minutes",
+            (F.unix_timestamp("tpep_dropoff_datetime")
+             - F.unix_timestamp("tpep_pickup_datetime")) / 60.0
+        )
 
-    print(f"\n{'='*60}")
-    print(f"  SCHEMA EVOLUTION COMPLETE")
-    print(f"{'='*60}")
+        # Handle the new column: fill nulls for old records
+        df = df.withColumn(
+            new_col,
+            F.coalesce(F.col(new_col), F.lit(0.0))
+        )
+
+        df = df.filter(F.col("trip_duration_minutes").between(0.5, 720))
+
+        silver_evolved_path = str(SILVER_DIR / "yellow_trips_evolved")
+        df.write.mode("overwrite").parquet(silver_evolved_path)
+
+        print(f"    Silver records: {df.count():,}")
+        print(f"    Written to: {silver_evolved_path}")
+
+        # Show distribution of new column
+        print(f"\n    {new_col} distribution in Silver:")
+        df.groupBy(new_col).count().orderBy(F.desc("count")).show(10, truncate=False)
+
+        # -------------------------------------------------------------------
+        # 6. Gold layer backward compatibility
+        # -------------------------------------------------------------------
+        # Databricks: Existing Gold views/tables continue to work because
+        # adding a column doesn't break existing queries.
+        print(f"\n[6] Gold layer backward compatibility check...")
+        print(f"    Existing Gold queries that don't reference {new_col}")
+        print(f"    continue to work without modification.")
+
+        # Existing Gold query: daily metrics (does NOT use new column)
+        daily_metrics = (
+            df
+            .groupBy(F.to_date("tpep_pickup_datetime").alias("pickup_date"))
+            .agg(
+                F.count("*").alias("total_trips"),
+                F.round(F.avg("fare_amount"), 2).alias("avg_fare"),
+                F.round(F.avg("trip_duration_minutes"), 2).alias("avg_duration"),
+            )
+            .orderBy("pickup_date")
+        )
+
+        print(f"\n    Sample Gold query (daily metrics) -- still works:")
+        daily_metrics.show(5, truncate=False)
+
+        # New Gold query USING the new column
+        if new_col == "airport_fee":
+            print(f"\n    New Gold query using airport_fee:")
+            df.groupBy(
+                F.when(F.col("airport_fee") > 0, "airport")
+                .otherwise("non_airport")
+                .alias("trip_type")
+            ).agg(
+                F.count("*").alias("trips"),
+                F.round(F.avg("fare_amount"), 2).alias("avg_fare"),
+                F.round(F.sum("airport_fee"), 2).alias("total_airport_fees"),
+            ).show(truncate=False)
+
+        # -------------------------------------------------------------------
+        # Summary
+        # -------------------------------------------------------------------
+        print(f"\n{'='*60}")
+        print(f"  SCHEMA EVOLUTION COMPLETE")
+        print(f"{'='*60}")
+        print(f"  Key takeaways:")
+        print(f"  1. Bronze: unionByName(allowMissingColumns=True) handles")
+        print(f"     schema drift automatically (Databricks: mergeSchema=true)")
+        print(f"  2. Silver: Fill nulls for the new column in old records")
+        print(f"  3. Gold: Existing queries are backward compatible")
+        print(f"  4. Databricks Auto Loader + DLT handle this automatically")
+
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

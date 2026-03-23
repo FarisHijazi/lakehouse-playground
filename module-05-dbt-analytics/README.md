@@ -2,10 +2,11 @@
 
 ## Why This Module Exists
 
-You have raw data sitting in files. You have a warehouse (DuckDB) that can read those files.
-But raw data is not analytics-ready data. Column names are inconsistent, dates come in three
-different formats, duplicates lurk in the listening events, and business logic (like "what
-counts as an active user?") lives in someone's head instead of in version-controlled SQL.
+You have raw taxi trip data sitting in parquet files. You have a warehouse (DuckDB) that can
+read those files. But raw data is not analytics-ready data. Column names are inconsistent
+across yellow and green taxi schemas, negative fares appear from disputes and adjustments,
+timestamps need validation, and business logic (like "what counts as an airport trip?") lives
+in someone's head instead of in version-controlled SQL.
 
 dbt (data build tool) solves this. It is the transformation layer -- the "T" in ELT -- that
 turns raw, messy source data into clean, tested, documented models that analysts and
@@ -27,6 +28,28 @@ tables/views, managing dependencies, running tests, and generating documentation
 - An extraction tool (it does not pull data from APIs or databases)
 - A loading tool (it does not move data into your warehouse)
 - An orchestrator (it does not schedule jobs -- that is Airflow's job)
+
+## dbt in Production: Databricks and Other Warehouses
+
+This module uses **dbt-duckdb** for local development, but the same patterns apply directly
+to production data platforms. In real-world lakehouse architectures, dbt is commonly paired
+with **Databricks** using the **dbt-databricks** adapter. The key differences:
+
+| Aspect | dbt-duckdb (this module) | dbt-databricks (production) |
+|--------|--------------------------|----------------------------|
+| Warehouse | Local DuckDB file | Databricks SQL Warehouse or cluster |
+| Storage | Local parquet files | Delta Lake on cloud object storage |
+| Scale | Single machine, GBs | Distributed compute, TBs to PBs |
+| Profile | `type: duckdb` | `type: databricks` |
+| Catalog | DuckDB schemas | Unity Catalog (catalog.schema.table) |
+| Materialization | table, view | table, view, incremental (Delta) |
+
+Everything you learn here -- model layers, `ref()`, testing, documentation, macros,
+snapshots -- transfers directly. The SQL is the same. The project structure is the same.
+Only the connection profile changes.
+
+Other common adapters include dbt-bigquery, dbt-snowflake, and dbt-redshift. The dbt
+ecosystem is adapter-agnostic by design.
 
 ## dbt vs Traditional ETL
 
@@ -52,20 +75,19 @@ Models are organized in layers:
 ```
 models/
   staging/         -- 1:1 with source tables, light cleaning
-  intermediate/    -- business logic joins, sessionization
+  intermediate/    -- business logic joins, enrichment
   marts/           -- final tables for analysts and dashboards
 ```
 
 **Staging models** (`stg_`):
 - One model per source table
 - Rename columns to consistent conventions
-- Cast types, parse dates, trim strings
-- Deduplicate if needed
+- Cast types, validate timestamps
 - No business logic, no joins
 
 **Intermediate models** (`int_`):
 - Join staging models together
-- Apply business logic (sessionization, enrichment)
+- Apply business logic (zone enrichment, derived metrics)
 - Not exposed to end users directly
 
 **Mart models** (`mart_`):
@@ -79,10 +101,10 @@ The single most important concept in dbt. Instead of hardcoding table names:
 
 ```sql
 -- Bad: hardcoded reference
-SELECT * FROM stg_users
+SELECT * FROM stg_yellow_trips
 
 -- Good: dbt-managed reference
-SELECT * FROM {{ ref('stg_users') }}
+SELECT * FROM {{ ref('stg_yellow_trips') }}
 ```
 
 `ref()` does two things:
@@ -94,7 +116,7 @@ SELECT * FROM {{ ref('stg_users') }}
 References raw data that dbt does not manage:
 
 ```sql
-SELECT * FROM {{ source('raw', 'users') }}
+SELECT * FROM {{ source('raw', 'yellow_tripdata') }}
 ```
 
 Sources are defined in YAML, with freshness checks, descriptions, and column docs.
@@ -106,7 +128,7 @@ dbt has two kinds of tests:
 **Schema tests** (declared in YAML):
 ```yaml
 columns:
-  - name: user_id
+  - name: location_id
     tests:
       - unique
       - not_null
@@ -116,11 +138,11 @@ Built-in tests: `unique`, `not_null`, `accepted_values`, `relationships`.
 
 **Data tests** (standalone SQL files in `tests/`):
 ```sql
--- tests/assert_positive_listen_duration.sql
+-- tests/assert_positive_fare.sql
 -- Any rows returned = test failure
 SELECT *
-FROM {{ ref('stg_listening_events') }}
-WHERE listened_seconds < 0
+FROM {{ ref('int_trips_enriched') }}
+WHERE fare_amount < 0
 ```
 
 ### Documentation
@@ -138,32 +160,35 @@ dbt docs serve
 ### Seeds
 
 CSV files that dbt loads into your warehouse as tables. Good for:
-- Country code lookups
+- Borough reference data
 - Category mappings
 - Static reference data
 
 ### Snapshots
 
-Track changes over time using Slowly Changing Dimensions (SCD Type 2). If a podcast
-changes its category, the snapshot preserves both the old and new values with
-valid_from/valid_to timestamps.
+Track changes over time using Slowly Changing Dimensions (SCD Type 2). If a taxi
+zone changes its borough assignment or name, the snapshot preserves both the old
+and new values with valid_from/valid_to timestamps.
 
 ### Macros
 
 Reusable Jinja functions. Write once, use across models:
 
 ```sql
-{% macro cents_to_dollars(column_name) %}
-  ({{ column_name }} / 100.0)::numeric(10,2)
+{% macro clean_fare(column_name) %}
+    case
+        when {{ column_name }} < 0 then 0
+        else {{ column_name }}
+    end
 {% endmacro %}
 ```
 
 ## dbt Best Practices
 
 ### Naming Conventions
-- Staging: `stg_{source}_{table}` (e.g., `stg_raw_users`)
-- Intermediate: `int_{concept}` (e.g., `int_listens_enriched`)
-- Marts: `mart_{concept}` (e.g., `mart_daily_listens`)
+- Staging: `stg_{source_table}` (e.g., `stg_yellow_trips`)
+- Intermediate: `int_{concept}` (e.g., `int_trips_enriched`)
+- Marts: `mart_{concept}` (e.g., `mart_daily_metrics`)
 
 ### Model Configuration
 - Staging models: materialized as `view` (lightweight, always fresh)
@@ -187,7 +212,7 @@ Reusable Jinja functions. Write once, use across models:
                          |
                          v
                     +-----------+
-                    | Warehouse | (DuckDB, BigQuery, Snowflake, Redshift)
+                    | Warehouse | (DuckDB, Databricks, BigQuery, Snowflake)
                     +-----------+
                          |
                          v
@@ -206,23 +231,28 @@ then dbt transforms it in place (T). This is the ELT pattern.
 
 ## The Data
 
-You will work with the same podcast platform dataset from previous modules:
+You will work with real NYC Taxi and Limousine Commission (TLC) trip data:
 
-| Dataset | Format | Records | Description |
-|---------|--------|---------|-------------|
-| `users.csv` | CSV | 5,000 | User profiles (messy dates, mixed genders) |
-| `podcasts.json` | JSON | 10 | Podcast metadata (Arabic/English names) |
-| `episodes.json` | JSON | 784 | Episode details (duration, season) |
-| `listening_events/` | JSONL | ~200k | Daily event files across years |
-| `ad_events.json` | JSON | 18,071 | Ad impressions and revenue |
-| `cdn_logs.csv` | CSV | 50,000 | CDN delivery metrics |
+| Dataset | Format | Description |
+|---------|--------|-------------|
+| `yellow_tripdata_*.parquet` | Parquet | Yellow taxi trip records (Manhattan-centric) |
+| `green_tripdata_*.parquet` | Parquet | Green taxi trip records (outer boroughs) |
+| `fhvhv_tripdata_*.parquet` | Parquet | For-hire vehicles: Uber, Lyft (high volume) |
+| `taxi_zone_lookup.csv` | CSV | 265 taxi zones across 5 boroughs |
+| `nyc_weather_2023.csv` | CSV | Daily weather from Central Park NOAA station |
+| `vendors.csv` | CSV | Vendor ID to name mapping |
+| `rate_codes.csv` | CSV | Rate code descriptions |
+| `payment_types.csv` | CSV | Payment type descriptions |
+| `fhv_bases.csv` | CSV | FHV base license numbers and company names |
 
 ### Known Data Issues (Your dbt Models Must Handle These)
-- `users.csv`: signup_date in three formats (YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY)
-- `users.csv`: gender values are inconsistent (m/male/M, f/female/F)
-- `users.csv`: missing cities (nulls and empty strings)
-- `listening_events/`: duplicate event_ids across files
-- `listening_events/`: some listened_seconds values are negative or absurdly large
+- Negative fare amounts from disputes and adjustments
+- Zero-distance trips (meter not engaged or very short trips)
+- Trips with dropoff before pickup (timestamp errors)
+- Passenger counts of 0 or unreasonably high values
+- Location IDs not in the zone lookup (zone 264, 265 edge cases)
+- Schema differences between yellow and green taxi data
+- FHV data has a completely different fare structure
 
 ## Getting Started
 
@@ -242,13 +272,16 @@ dbt --version
 # 3. Test the connection
 dbt debug
 
-# 4. Run all models
+# 4. Load seed data
+dbt seed
+
+# 5. Run all models
 dbt run
 
-# 5. Run all tests
+# 6. Run all tests
 dbt test
 
-# 6. Generate docs
+# 7. Generate docs
 dbt docs generate
 dbt docs serve
 ```
@@ -261,34 +294,34 @@ module-05-dbt-analytics/
   profiles.yml             -- Connection profile (DuckDB)
   models/
     staging/               -- 1:1 source cleaning
-      stg_users.sql
-      stg_podcasts.sql
-      stg_episodes.sql
-      stg_listening_events.sql
-      stg_ad_events.sql
+      stg_yellow_trips.sql
+      stg_green_trips.sql
+      stg_fhv_trips.sql
+      stg_zones.sql
+      stg_weather.sql
       schema.yml           -- Tests and docs for staging models
     intermediate/          -- Business logic
-      int_listens_enriched.sql
-      int_user_sessions.sql
+      int_trips_enriched.sql
+      int_daily_trip_summary.sql
       schema.yml
     marts/                 -- Analytics-ready tables
-      mart_daily_listens.sql
-      mart_podcast_performance.sql
-      mart_user_cohorts.sql
-      mart_ad_revenue.sql
+      mart_daily_metrics.sql
+      mart_zone_performance.sql
+      mart_hourly_patterns.sql
+      mart_weather_impact.sql
       schema.yml
   snapshots/
-    scd_podcasts.sql       -- SCD Type 2 for podcast metadata
+    scd_zones.sql          -- SCD Type 2 for zone metadata
   macros/
     generate_schema_name.sql
     date_spine.sql
-    clean_date.sql
+    clean_fare.sql
   tests/
-    assert_positive_listen_duration.sql
-    assert_no_orphaned_listens.sql
-    assert_revenue_not_negative.sql
+    assert_no_orphaned_trips.sql
+    assert_positive_fare.sql
+    assert_valid_trip_duration.sql
   seeds/
-    country_codes.csv
+    borough_info.csv
   exercises.md             -- 10 guided exercises + bonus challenges
   README.md
 ```
