@@ -1,0 +1,45 @@
+version: 2
+
+models:
+  - name: int_listens_enriched
+    description: >
+      Listening events enriched with user, episode, and podcast metadata.
+      This is the central fact model that mart models build on. Includes
+      listen completion percentage as a derived metric.
+    columns:
+      - name: event_id
+        description: "Unique event identifier"
+        tests:
+          - unique
+          - not_null
+      - name: listen_pct
+        description: "Percentage of episode listened (0-100+)"
+      - name: podcast_id
+        description: "Podcast identifier (from episode join)"
+      - name: event_date
+        description: "Date of the listening event"
+
+  - name: int_user_sessions
+    description: >
+      User listening sessions derived by detecting gaps of 30+ minutes
+      between consecutive events. Each row is one session.
+    columns:
+      - name: session_id
+        description: "Unique session identifier (user_id + session_num)"
+        tests:
+          - unique
+          - not_null
+      - name: user_id
+        description: "User who had the session"
+        tests:
+          - not_null
+      - name: session_start
+        description: "Timestamp of the first event in the session"
+      - name: session_end
+        description: "Timestamp of the last event in the session"
+      - name: events_in_session
+        description: "Number of events in the session"
+      - name: episodes_in_session
+        description: "Number of distinct episodes in the session"
+      - name: total_listened_seconds
+        description: "Total seconds listened in the session"

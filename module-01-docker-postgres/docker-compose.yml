@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lakehouse-postgres
+    environment:
+      POSTGRES_USER: lakehouse
+      POSTGRES_PASSWORD: lakehouse123
+      POSTGRES_DB: podcast_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      # Schema initialization -- Postgres runs .sql files in /docker-entrypoint-initdb.d/
+      # on first boot only. Delete the volume to re-initialize.
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      # Persist data across container restarts
+      - pgdata:/var/lib/postgresql/data
+      # Mount raw data so COPY commands can read from inside the container
+      - ../data/raw:/data/raw:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakehouse -d podcast_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: lakehouse-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@lakehouse.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
